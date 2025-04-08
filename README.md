@@ -19,6 +19,9 @@ Replace: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/
 ## symmetry.py
 Add: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/data/module/symmetry_awareness.py
 
+## yaml.py
+Add: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/data/parse/yaml.py
+
 ## example_boltz_symmetry_test.sh
 Use this file as an example. However, importantly, the setup file generates an accurate yaml. So you can simply use this. Be wary, as this will require changes to the shell script, as you need to call a different yaml if you want to automate this. 
 
