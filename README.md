@@ -3,7 +3,7 @@
 An important note is that partial_diffusion_setup.py will create 2 triangles. Ensure that it creates [A,B,C] matches up with [D,E,F]. Importantly, when using the I subquotient C3 matrices (size=20), ensure that A maps to D, B maps to E, and D maps to F. The code should be doing this right now, but just verify using a few examples, as it has the potential to break down the line functionality. 
 
 
-# Install matlibplot
+# Install matplotlib
 pip install matplotlib
 
 # File Replacements:
