@@ -792,6 +792,7 @@ class AtomDiffusion(nn.Module):
         Performs reverse diffusion sampling with rigid symmetry enforcement.
         Constraints force subunit COMs to match input reference COMs.
         Derived rotations are used ONLY for noise/denoising symmetrization.
+        ** MODIFIED: Calculates I/C3 inter-trimer rotation directly. **
         """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
@@ -923,14 +924,14 @@ class AtomDiffusion(nn.Module):
         # ------- END DIAGNOSTIC/TARGET COM Calculation -------
 
 
-        # ======= Calculate Rotations for Symmetrical Noise/Denoising (NO AVERAGING) =======
+        # ======= Calculate Rotations for Symmetrical Noise/Denoising =======
+        # === MODIFICATION: Calculate I/C3 inter-trimer rotation directly ===
         self.rot_mats_noI = None # Reset instance variable
 
-        # This section only calculates rotations IF needed for symmetrical noise/denoising
-        # It does NOT affect the rigid constraints which now use target_coms_all
         if self.symmetry_type == 'I' and n_subunits_found >= 6:
-            print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (No Averaging)")
-            # Ensure we have the required COMs with batch dimension (B, 3) from target_coms_all
+            # print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (Direct Calculation)") # OLD
+            print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (Direct Calculation)") # NEW NAME
+
             if target_coms_all is None or target_coms_all.shape[1] < 6:
                  print("Warning: Insufficient target COMs found for I symmetry rotation calculation. Symmetrical noise/denoising might be incorrect.")
                  self.rot_mats_noI = None
@@ -939,9 +940,9 @@ class AtomDiffusion(nn.Module):
                 com_A_ref = target_coms_all[:, 0, :]
                 com_B_ref = target_coms_all[:, 1, :]
                 com_C_ref = target_coms_all[:, 2, :]
-                com_D_ref = target_coms_all[:, 3, :]
-                com_E_ref = target_coms_all[:, 4, :]
-                com_F_ref = target_coms_all[:, 5, :]
+                com_D_ref = target_coms_all[:, 3, :] # Needed for direct A->D vector
+                com_E_ref = target_coms_all[:, 4, :] # Potentially needed if we calculate A->E directly too
+                com_F_ref = target_coms_all[:, 5, :] # Potentially needed if we calculate A->F directly too
 
                 # Ensure subunits list is correct length before indexing
                 if len(subunits) < 6:
@@ -949,60 +950,62 @@ class AtomDiffusion(nn.Module):
 
                 trimer1_indices = torch.cat(subunits[:3])
                 trimer2_indices = torch.cat(subunits[3:6])
-                # Recalculate Trimer COMs just in case (using all batch elements)
+                # Recalculate Trimer COMs (using all batch elements)
                 com_ABC_ref = calculate_com(coords_ref[:, trimer1_indices, :]) # (n_batches, 3)
                 com_DEF_ref = calculate_com(coords_ref[:, trimer2_indices, :]) # (n_batches, 3)
 
+                # --- Calculate Rotations WITHIN Trimer ABC (Direct) ---
                 vec_A_rel = com_A_ref - com_ABC_ref # (n_batches, 3)
                 vec_B_rel = com_B_ref - com_ABC_ref # (n_batches, 3)
                 vec_C_rel = com_C_ref - com_ABC_ref # (n_batches, 3)
 
-                # Calculate rotations, ensuring inputs are (n_batches, 3)
-                # compute_rotation_matrix_from_vectors expects (B, 3) and returns (B, 3, 3)
                 R_B_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_B_rel, device=device, dtype=coords_ref.dtype)
                 R_C_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_C_rel, device=device, dtype=coords_ref.dtype)
 
-                i_sub_c3_candidates = symmetry.get_point_group('I').to(device, coords_ref.dtype)
-                # print(f"DEBUG: Loaded {i_sub_c3_candidates.shape[0]} I/C3 candidate rotations.")
+                # --- Calculate Rotation BETWEEN Trimers (A->D, Direct) ---
+                # Calculate the corresponding vector within Trimer DEF
+                vec_D_rel = com_D_ref - com_DEF_ref # (n_batches, 3)
 
-                # Pass B tensors to find_best_rotation
-                R_I_sub_C3_batch = find_best_rotation_point_cloud(
-                    target_point=com_DEF_ref, # Pass full batch (n_batches, 3)
-                    candidate_rots=i_sub_c3_candidates, # (N_rots, 3, 3)
-                    ref_point=com_ABC_ref # Pass full batch (n_batches, 3)
+                # Directly compute the rotation matrix aligning vec_A_rel to vec_D_rel
+                R_I_sub_C3_batch = compute_rotation_matrix_from_vectors(
+                    vec_A_rel,
+                    vec_D_rel,
+                    device=device,
+                    dtype=coords_ref.dtype
                 ) # Returns (n_batches, 3, 3)
+                print(f"DEBUG: Calculated inter-trimer rotation R_I_sub_C3 directly. Shape: {R_I_sub_C3_batch.shape}")
 
                 # --- NO AVERAGING ---
                 # Select the rotation for the first batch item -> (3, 3) for stacking
-                # This assumes B=1, or that the same rotations apply across the batch for noise purposes
                 if n_batches != 1:
                      print(f"WARNING: Batch size is {n_batches}, but extracting only the first rotation for self.rot_mats_noI used in noise/denoising.")
                 R_B = R_B_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
                 R_C = R_C_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
-                R_I_sub_C3 = R_I_sub_C3_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
+                R_I_sub_C3 = R_I_sub_C3_batch[0] # Extract (3, 3) from (n_batches, 3, 3) - Now directly calculated A->D rotation
 
-                # Combine rotations for A->D, A->E, A->F (approximations)
-                # Ensure matrix multiplications are compatible (3,3) @ (3,3)
+                # --- Combine rotations for A->E, A->F (using compositions) ---
+                # While R_I_sub_C3 is now direct A->D, keep the composition logic
+                # for A->E and A->F, assuming the relationships hold.
+                # R_E = R_I_sub_C3 @ R_B should now more accurately reflect A->E
+                # R_F = R_I_sub_C3 @ R_C should now more accurately reflect A->F
                 R_E = R_I_sub_C3 @ R_B
                 R_F = R_I_sub_C3 @ R_C
 
                 effective_rots = [
-                    R_B,        # A -> B
-                    R_C,        # A -> C
-                    R_I_sub_C3, # A -> D (approx via Trimer COM)
-                    R_E,        # A -> E (approx via Trimer COM)
-                    R_F         # A -> F (approx via Trimer COM)
+                    R_B,        # A -> B (Direct intra)
+                    R_C,        # A -> C (Direct intra)
+                    R_I_sub_C3, # A -> D (Direct inter via A_rel -> D_rel)
+                    R_E,        # A -> E (Composition using direct R_I_sub_C3)
+                    R_F         # A -> F (Composition using direct R_I_sub_C3)
                 ]
                 self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, coords_ref.dtype) # Shape [5, 3, 3]
-                print(f"DEBUG: Calculated effective rotations for noise/denoising (NO AVG). Shape: {self.rot_mats_noI.shape}")
+                print(f"DEBUG: Calculated effective rotations for noise/denoising (Direct I/C3). Shape: {self.rot_mats_noI.shape}")
 
         elif self.symmetry_type and n_subunits_found > 1:
              print(f"DEBUG: Using precomputed {self.symmetry_type} rotations from __init__ for noise/denoising.")
-             # Assumes self.rot_mats_noI was loaded correctly in __init__
              if self.rot_mats_noI is None:
                   print(f"Warning: Symmetry {self.symmetry_type} requested, but self.rot_mats_noI is None (from __init__). Symmetrical noise/denoising might not work correctly.")
              else:
-                  # Ensure the precomputed matrix is on the correct device/dtype
                   self.rot_mats_noI = self.rot_mats_noI.to(device, coords_ref.dtype)
                   print(f"DEBUG: Using precomputed rot_mats_noI. Shape: {self.rot_mats_noI.shape}")
         else: # Monomer or no symmetry specified
@@ -1013,45 +1016,40 @@ class AtomDiffusion(nn.Module):
 
         # ------- START DIAGNOSTIC: Calculate Desired COMs (Now just print targets) -------
         print("\n" + "="*20 + " DIAGNOSTIC: Desired COMs (Are the Input COMs) " + "="*20)
-        # target_coms_all has shape (n_batches, N_subunits, 3)
         if target_coms_all is not None:
             desired_coms_diag = {}
             num_subunits_in_target = target_coms_all.shape[1]
 
             if b_idx_diag < n_batches: # Print diagnostics only for the first batch element
                 for i_sub in range(num_subunits_in_target):
-                    # Determine name based on context
-                    if n_subunits_found > 1 and num_subunits_in_target == n_subunits_found : # Standard subunit case
+                    if n_subunits_found > 1 and num_subunits_in_target == n_subunits_found :
                         sub_name = chr(ord('A') + i_sub)
-                    elif num_subunits_in_target == 1: # Global case
+                    elif num_subunits_in_target == 1:
                         sub_name = 'Global'
-                    else: # Fallback naming
+                    else:
                         sub_name = f"Subunit_{i_sub}"
 
                     com_desired_sub_diag = target_coms_all[b_idx_diag, i_sub, :].cpu().numpy()
                     desired_coms_diag[sub_name] = com_desired_sub_diag
                     print(f"Batch {b_idx_diag} - Desired COM {sub_name}: {com_desired_sub_diag}")
 
-                # Add Trimer COMs for diagnostics if applicable, comparing to initial calculated ones
                 if 'Trimer1' in initial_coms:
                     print(f"Batch {b_idx_diag} - Desired COM Trimer1 (ABC): {initial_coms['Trimer1']} (matches initial)")
                 if 'Trimer2' in initial_coms:
                     print(f"Batch {b_idx_diag} - Desired COM Trimer2 (DEF): {initial_coms['Trimer2']} (matches initial)")
 
-                # Compare Initial vs Desired (should now be identical for A, B, C...)
                 print(f"\nBatch {b_idx_diag} - COM Comparison (Initial vs Desired):")
                 for key in initial_coms:
                     initial_np = initial_coms[key]
-                    # Handle potential key mismatch if global was used
                     lookup_key = key
                     if key == 'Global' and 'Global' not in desired_coms_diag and num_subunits_in_target==1:
-                         lookup_key = 'Subunit_0' # Adjust if needed based on fallback naming
+                         lookup_key = 'Subunit_0'
                     desired_np = desired_coms_diag.get(lookup_key)
 
                     if desired_np is not None:
                          diff = np.linalg.norm(initial_np - desired_np)
                          print(f"  COM {key}: Initial={initial_np}, Desired={desired_np}, Diff Norm={diff:.4f}")
-                    elif key in ['Trimer1', 'Trimer2']: # Trimer info printed above
+                    elif key in ['Trimer1', 'Trimer2']:
                          pass
                     else:
                          print(f"  COM {key}: Initial={initial_np}, Desired= N/A (Key '{lookup_key}' not found in desired_coms_diag)")
@@ -1091,7 +1089,6 @@ class AtomDiffusion(nn.Module):
              coords=current_coords,
              subunits=subunits,
              desired_coms_all_subunits=target_coms_all
-             # rot_mats is no longer passed here
         )
         print(f"DEBUG: Applied initial rigid constraints using target COMs.")
 
