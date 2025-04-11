@@ -789,8 +789,9 @@ class AtomDiffusion(nn.Module):
         **network_condition_kwargs,
     ):
         """
-        Performs reverse diffusion sampling.
-        For 'I' symmetry, dynamically assigns rotations based on input trimers (I/C3).
+        Performs reverse diffusion sampling with rigid symmetry enforcement.
+        For 'I' symmetry, dynamically assigns rotations based on input trimers (I/C3)
+        and enforces constraints using input geometry.
         """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
@@ -799,33 +800,38 @@ class AtomDiffusion(nn.Module):
         device = self.device
         feats = network_condition_kwargs.get("feats", {})
 
-        # 1. Get Input Coordinates (CLEAN)
-        input_coords = network_condition_kwargs.get("input_coords", None)
-        if input_coords is None:
-             input_coords = feats.get("coords", None)
-             if input_coords is None:
-                 raise ValueError("Coordinates must be provided either via 'input_coords' kwarg or in 'feats'.")
-             if input_coords.ndim == 4:
-                 B_, N_, L_, _ = input_coords.shape
-                 input_coords = input_coords.reshape(B_, N_*L_, 3)
-             input_coords = input_coords.repeat_interleave(multiplicity, 0)
+        # 1. Get Input Coordinates (CLEAN) - The Reference Structure
+        input_coords_ref = network_condition_kwargs.get("input_coords", None)
+        if input_coords_ref is None:
+             input_coords_ref = feats.get("coords", None)
+             if input_coords_ref is None:
+                 raise ValueError("Reference coordinates must be provided either via 'input_coords' kwarg or in 'feats'.")
+             if input_coords_ref.ndim == 4: # Reshape if needed (B, N_res, L_atom, 3) -> (B, A, 3)
+                 B_, N_, L_, _ = input_coords_ref.shape
+                 input_coords_ref = input_coords_ref.reshape(B_, N_*L_, 3)
 
-        coords = input_coords.clone().to(device)
-        if coords.ndim != 3 or coords.shape[0] != n_batches or coords.shape[1] != n_atoms:
+        # Repeat for multiplicity AFTER ensuring correct shape
+        if input_coords_ref.shape[0] != n_batches // multiplicity:
+             raise ValueError(f"Input coords batch size {input_coords_ref.shape[0]} doesn't match atom_mask batch size {n_batches} / multiplicity {multiplicity}.")
+        input_coords_ref = input_coords_ref.repeat_interleave(multiplicity, 0)
+
+        # Ensure final shape and dtype are correct
+        if input_coords_ref.shape != (n_batches, n_atoms, 3):
              try:
-                 coords = coords.view(n_batches, n_atoms, 3)
+                 input_coords_ref = input_coords_ref.view(n_batches, n_atoms, 3)
              except RuntimeError as e:
-                 raise ValueError(f"Input coordinates shape {input_coords.shape} is incompatible with expected ({n_batches}, {n_atoms}, 3). Error: {e}")
+                 raise ValueError(f"Input coordinates shape {input_coords_ref.shape} is incompatible with expected ({n_batches}, {n_atoms}, 3). Error: {e}")
 
-        # Ensure coords are float32 for calculations
-        coords = coords.float()
-        network_condition_kwargs["feats"]["coords"] = coords
-        feats = network_condition_kwargs["feats"] # Update feats reference
+        coords_ref = input_coords_ref.clone().to(device).float() # Use this for deriving constraints
+        network_condition_kwargs["feats"]["coords"] = coords_ref # Update feats with the reference coords
+        feats = network_condition_kwargs["feats"] # Update local feats reference
 
+        # Initialize current_coords (start with reference for noise addition)
+        current_coords = coords_ref.clone()
 
         # ======= DYNAMIC SYMMETRY RECALCULATION & ASSIGNMENT (I/C3 specific) =======
-        self.rot_mats_noI = None # Reset instance variable
-        desired_com_final = None # Will be set based on input A COM
+        self.rot_mats_noI = None # Reset instance variable for rotations B->F etc.
+        desired_com_final_A = None # Target COM for subunit A constraint
 
         # Get atom indices for each subunit. For 'I', expects A, B, C, D, E, F order.
         subunits = symmetry.get_subunit_atom_indices(
@@ -833,120 +839,117 @@ class AtomDiffusion(nn.Module):
         )
         n_subunits_found = len(subunits)
 
-
         if self.symmetry_type == 'I':
+            print("DEBUG: Applying I/C3 dynamic symmetry logic in sample()")
             if n_subunits_found < 6:
-                 raise ValueError(f"Expected at least 6 subunits (A-F) for 'I' symmetry (I/C3), but found {n_subunits_found}.")
+                 raise ValueError(f"Expected at least 6 subunits (A-F) for 'I' symmetry (I/C3), but found {n_subunits_found}. Check input chain IDs (expect 0-5) and 'get_subunit_atom_indices'.")
 
-            # Assume first 6 subunits are A, B, C, D, E, F in order
+            # Assume first 6 subunits are A, B, C, D, E, F in order (indices from feats)
             subunit_indices = {
                 'A': subunits[0], 'B': subunits[1], 'C': subunits[2],
                 'D': subunits[3], 'E': subunits[4], 'F': subunits[5]
             }
-            # Combine indices for trimers
+            # Check for empty subunits which would break COM/Rotation calculations
+            for name, indices in subunit_indices.items():
+                if indices.numel() == 0:
+                    raise ValueError(f"Subunit '{name}' for 'I' symmetry has no atoms. Cannot derive constraints.")
+
+            # Combine indices for trimers using the reference coords_ref
             trimer1_indices = torch.cat(subunits[:3])
             trimer2_indices = torch.cat(subunits[3:6])
 
-            # Calculate Input COMs (per batch element)
-            com_A_input = calculate_com(coords[:, subunit_indices['A'], :]) # (B, 3)
-            com_B_input = calculate_com(coords[:, subunit_indices['B'], :]) # (B, 3)
-            com_C_input = calculate_com(coords[:, subunit_indices['C'], :]) # (B, 3)
-            # com_D_input = calculate_com(coords[:, subunit_indices['D'], :]) # (B, 3) # Not directly needed for rotation finding
-            # com_E_input = calculate_com(coords[:, subunit_indices['E'], :]) # (B, 3)
-            # com_F_input = calculate_com(coords[:, subunit_indices['F'], :]) # (B, 3)
-            com_ABC_input = calculate_com(coords[:, trimer1_indices, :])    # (B, 3)
-            com_DEF_input = calculate_com(coords[:, trimer2_indices, :])    # (B, 3)
+            # Calculate Input COMs (per batch element) from REFERENCE structure
+            com_A_ref = calculate_com(coords_ref[:, subunit_indices['A'], :]) # (B, 3)
+            com_B_ref = calculate_com(coords_ref[:, subunit_indices['B'], :]) # (B, 3)
+            com_C_ref = calculate_com(coords_ref[:, subunit_indices['C'], :]) # (B, 3)
+            com_ABC_ref = calculate_com(coords_ref[:, trimer1_indices, :])    # (B, 3) Trimer 1 COM
+            com_DEF_ref = calculate_com(coords_ref[:, trimer2_indices, :])    # (B, 3) Trimer 2 COM
 
-            # Set the final desired COM for subunit A based on input
+            # *** SET CONSTRAINT TARGET: Desired COM for subunit A is its COM in the reference structure ***
             # Shape must be (B, 1, 3) for constraint function interface
-            desired_com_final = com_A_input.unsqueeze(1)
+            desired_com_final_A = com_A_ref.unsqueeze(1)
+            print(f"DEBUG: Target COM for Subunit A set from reference: Shape {desired_com_final_A.shape}")
 
-            # --- Find C3 rotations (R_B, R_C) around Trimer 1 COM ---
-            vec_A_rel = com_A_input - com_ABC_input # Vector from trimer COM to A COM (B, 3)
-            vec_B_rel = com_B_input - com_ABC_input # Vector from trimer COM to B COM (B, 3)
-            vec_C_rel = com_C_input - com_ABC_input # Vector from trimer COM to C COM (B, 3)
+
+            # --- Find C3 rotations (R_B, R_C) around Trimer 1 COM using REFERENCE structure ---
+            vec_A_rel = com_A_ref - com_ABC_ref # Vector from trimer COM to A COM (B, 3)
+            vec_B_rel = com_B_ref - com_ABC_ref # Vector from trimer COM to B COM (B, 3)
+            vec_C_rel = com_C_ref - com_ABC_ref # Vector from trimer COM to C COM (B, 3)
 
             # Find best rotation mapping vec_A_rel -> vec_B_rel for each batch item
-            R_B = compute_rotation_matrix_from_vectors(vec_A_rel, vec_B_rel, device=device, dtype=coords.dtype) # (B, 3, 3)
+            R_B = compute_rotation_matrix_from_vectors(vec_A_rel, vec_B_rel, device=device, dtype=coords_ref.dtype) # (B, 3, 3)
             # Find best rotation mapping vec_A_rel -> vec_C_rel for each batch item
-            R_C = compute_rotation_matrix_from_vectors(vec_A_rel, vec_C_rel, device=device, dtype=coords.dtype) # (B, 3, 3)
+            R_C = compute_rotation_matrix_from_vectors(vec_A_rel, vec_C_rel, device=device, dtype=coords_ref.dtype) # (B, 3, 3)
 
-            # --- Find I/C3 rotation (R_I_sub_C3) mapping Trimer 1 COM -> Trimer 2 COM ---
+            # --- Find I/C3 rotation (R_I_sub_C3) mapping Trimer 1 COM -> Trimer 2 COM using REFERENCE structure ---
             # Get the 20 candidate I/C3 rotation matrices (these are batch-independent)
-            # Assuming get_point_group('I') now returns the 20 I/C3 matrices
-            print("DEBUG: Calling symmetry.get_point_group('I')")
-            i_sub_c3_candidates = symmetry.get_point_group('I').to(device, coords.dtype)
-            print(f"DEBUG: Shape of i_sub_c3_candidates: {i_sub_c3_candidates.shape}") # Should be [20, 3, 3]
-
-
+            # Ensure these are the matrices in the *original* frame
+            i_sub_c3_candidates = symmetry.get_point_group('I').to(device, coords_ref.dtype) # Should be (20, 3, 3)
+            print(f"DEBUG: Loaded {i_sub_c3_candidates.shape[0]} I/C3 candidate rotations.")
             if i_sub_c3_candidates.shape[0] != 20:
                  print(f"Warning: Expected 20 I/C3 candidate rotations, but got {i_sub_c3_candidates.shape[0]}. Proceeding anyway.")
 
-            # Find the best candidate rotation for each batch item mapping com_ABC -> com_DEF
+            # Find the best candidate rotation for each batch item mapping com_ABC_ref -> com_DEF_ref
             R_I_sub_C3 = find_best_rotation_point_cloud(
-                target_point=com_DEF_input,       # (B, 3)
+                target_point=com_DEF_ref,       # (B, 3)
                 candidate_rots=i_sub_c3_candidates, # (20, 3, 3)
-                ref_point=com_ABC_input           # (B, 3)
+                ref_point=com_ABC_ref           # (B, 3)
             ) # (B, 3, 3)
 
 
-            # --- Create the list of effective rotations relative to A ---
-            # These rotations will be applied to the centered coords of A to get B, C, D, E, F
-            # The constraint function applies R to the *centered* reference coords.
-            # Noise function applies R to the *noise vector* of reference atom.
-            # The rotations should represent the total transformation from A's frame to the target frame.
-
-            # We need a *single* set of rotations for self.rot_mats_noI [N-1, 3, 3]
-            # Let's average the batch-specific rotations. This is an approximation.
-            # A potentially better approach might involve modifying constraint/noise functions
-            # to handle batch-specific rotations, but aiming for minimal intrusion first.
-
+            # --- Create the list of effective rotations relative to A (for B, C, D, E, F) ---
+            # These rotations will be applied to the *centered* coords of A to get B, C, D, E, F
+            # in the constraint function.
+            # ** APPROXIMATION: Average batch-specific rotations to get a single set for noise/constraint **
+            # This is because apply_symmetry_constraints_rigid expects rot_mats of shape (N-1, 3, 3)
             R_B_avg = R_B.mean(dim=0)           # (3, 3)
             R_C_avg = R_C.mean(dim=0)           # (3, 3)
             R_I_sub_C3_avg = R_I_sub_C3.mean(dim=0) # (3, 3)
 
-            # Check if averaging caused determinant issues (optional but good practice)
-            # det_B = torch.linalg.det(R_B_avg)
-            # det_C = torch.linalg.det(R_C_avg)
-            # det_I = torch.linalg.det(R_I_sub_C3_avg)
-            # print(f"Avg Rot Determinants: R_B={det_B:.3f}, R_C={det_C:.3f}, R_I/C3={det_I:.3f}")
-            # Ideally, determinants should be close to 1. If not, averaging might be problematic.
-            # Could consider SVD orthogonalization: U, S, Vh = torch.linalg.svd(R_avg); R_ortho = U @ Vh
+            # Optional: Orthogonalize averaged matrices to ensure they are pure rotations
+            # U, _, Vh = torch.linalg.svd(R_B_avg); R_B_avg = U @ Vh
+            # U, _, Vh = torch.linalg.svd(R_C_avg); R_C_avg = U @ Vh
+            # U, _, Vh = torch.linalg.svd(R_I_sub_C3_avg); R_I_sub_C3_avg = U @ Vh
+            # print("DEBUG: Orthogonalized averaged rotation matrices.")
 
             effective_rots = [
                 R_B_avg,                          # A -> B
                 R_C_avg,                          # A -> C
-                R_I_sub_C3_avg,                   # A -> D (approx, maps A via the trimer mapping)
-                R_I_sub_C3_avg @ R_B_avg,         # A -> E
-                R_I_sub_C3_avg @ R_C_avg          # A -> F
-                # ... potentially extend this for all 20 trimers if needed
+                R_I_sub_C3_avg,                   # A -> D (maps A frame via trimer map)
+                R_I_sub_C3_avg @ R_B_avg,         # A -> E (apply B rot, then trimer map)
+                R_I_sub_C3_avg @ R_C_avg          # A -> F (apply C rot, then trimer map)
+                # Extend this if > 6 subunits need constraining based on I/C3 logic
             ]
 
-            # Assign the averaged, effective rotations to the instance variable used by other methods
-            # We only store rotations for subunits 1 to N-1 (B, C, D, E, F...)
-            self.rot_mats_noI = torch.stack(effective_rots, dim=0) # Shape [5, 3, 3] (or [59, 3, 3] if extended)
+            # Store the averaged, effective rotations for constraint/noise functions
+            self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, coords_ref.dtype) # Shape [5, 3, 3]
+            print(f"DEBUG: Calculated and averaged effective rotations for constraints. Shape: {self.rot_mats_noI.shape}")
 
         elif self.symmetry_type and n_subunits_found > 1:
-             # Handle other symmetry types (original dynamic assignment logic, if needed, or use precomputed from __init__)
-             # For simplicity with the prompt, let's assume __init__ handled other types correctly
-             # and self.rot_mats_noI was already set there if type is not 'I'.
-             # If dynamic assignment was needed for *all* types, the logic from the original `sample` could be adapted here.
-
-             # We still need a desired_com_final for the constraint function
+             # Handle other symmetry types: Use precomputed rot_mats from __init__
+             # Still need to set the desired_com_final_A based on reference input
+             print(f"DEBUG: Applying {self.symmetry_type} symmetry logic in sample() using precomputed rotations.")
              if not subunits: # Should not happen if n_subunits > 1
-                 desired_com_final = coords.mean(dim=1, keepdim=True)
+                 desired_com_final_A = coords_ref.mean(dim=1, keepdim=True) # Fallback: Center globally
              else:
-                com_A_input = calculate_com(coords[:, subunits[0], :]) # (B, 3)
-                desired_com_final = com_A_input.unsqueeze(1) # Use input COM of first subunit
+                 if subunits[0].numel() == 0:
+                     raise ValueError(f"Reference subunit (0) for {self.symmetry_type} has no atoms.")
+                 com_A_ref = calculate_com(coords_ref[:, subunits[0], :]) # (B, 3)
+                 desired_com_final_A = com_A_ref.unsqueeze(1) # Use input COM of first subunit (B, 1, 3)
 
-             # Use rot_mats from init (assuming it was setup correctly)
-             # self.rot_mats_noI should already be populated
-
-
+             # self.rot_mats_noI should already be populated from __init__
+             if self.rot_mats_noI is None:
+                  print(f"Warning: Symmetry {self.symmetry_type} requested, but self.rot_mats_noI is None. Was __init__ successful?")
+             else:
+                  print(f"DEBUG: Using precomputed rot_mats_noI from __init__. Shape: {self.rot_mats_noI.shape}")
 
         else: # Monomer or no symmetry specified
+            print("DEBUG: No symmetry or monomer case in sample().")
             self.rot_mats_noI = None
-            desired_com_final = coords.mean(dim=1, keepdim=True) # Center the whole thing
+            # For monomer, desired COM is often the origin or the mean of the input
+            com_ref = calculate_com(coords_ref).unsqueeze(1) # (B, 1, 3)
+            desired_com_final_A = com_ref # Constraint function will center the whole thing
+
 
         # ======= END DYNAMIC SYMMETRY RECALCULATION & ASSIGNMENT =======
 
@@ -958,92 +961,169 @@ class AtomDiffusion(nn.Module):
         start_index = max(0, num_sampling_steps - forward_diffusion_steps)
         start_sigma = sigmas[start_index]
         t_hat_initial = start_sigma * self.noise_scale
+        # Sigma at the *end* of the first (forward) step interval used for noise variance calculation
         sigma_tm_val_initial = sigmas[start_index + 1].item() if start_index + 1 < len(sigmas) else 0.0
 
-        # 4. Apply Initial Symmetrical Noise
-        # Uses self.rot_mats_noI which might be None (monomer) or set dynamically ('I') or from init (other symm)
-        sym_noise = self._symmetrical_noise(
-            coords, feats, subunits, self.rot_mats_noI, t_hat_initial, sigma_tm_val_initial
+        # 4. Apply Initial Symmetrical Noise to Current Coords
+        # Uses self.rot_mats_noI (might be None, dynamic 'I', or precomputed)
+        initial_sym_noise = self._symmetrical_noise(
+            current_coords, feats, subunits, self.rot_mats_noI, t_hat_initial, sigma_tm_val_initial
         )
-        coords_noisy = coords + sym_noise
-        current_coords = coords_noisy
+        current_coords = current_coords + initial_sym_noise # Add noise to start reverse diffusion
+        print(f"DEBUG: Applied initial symmetrical noise. Start sigma={start_sigma:.4f}, t_hat={t_hat_initial:.4f}")
 
-        # 5. Apply Initial Rigid Constraints (Centering/Rotation)
-        # Uses self.rot_mats_noI and the dynamically determined desired_com_final
-        if desired_com_final is None: # Should be set above, but fallback
-            desired_com_final = coords.mean(dim=1, keepdim=True)
+
+        # 5. Apply Initial Rigid Constraints
+        # Uses self.rot_mats_noI and the dynamically determined desired_com_final_A
+        if desired_com_final_A is None: # Should be set above, but fallback
+            print("Warning: desired_com_final_A was None before initial constraint. Centering globally.")
+            desired_com_final_A = torch.zeros((n_batches, 1, 3), device=device, dtype=current_coords.dtype)
 
         current_coords = self.apply_symmetry_constraints_rigid(
-             current_coords, subunits, self.rot_mats_noI, desired_com_final
+             current_coords,          # The noisy coordinates
+             subunits,
+             self.rot_mats_noI,
+             desired_com_final_A      # Target COM for subunit A
         )
+        print(f"DEBUG: Applied initial rigid constraints.")
 
         # 6. Build Reverse Schedule
         reverse_schedule = []
         for i in range(start_index, len(sigmas) - 1):
-            sigma_current = sigmas[i]
-            sigma_next = sigmas[i + 1]
+            sigma_current = sigmas[i]     # sigma_m (or sigma_{t_m})
+            sigma_next = sigmas[i + 1]      # sigma_{t_m+1} (or sigma_t)
+            # Gamma logic seems based on Karras, relates to noise level adjustment
             gamma_val = self.gamma_0 if sigma_current > self.gamma_min else 0.0
-            reverse_schedule.append((sigma_current, sigma_next, gamma_val))
+            reverse_schedule.append((sigma_current, sigma_next, gamma_val)) # (sigma_tm, sigma_t, gamma)
 
         # 7. Prepare for Denoising Loop
         token_repr = None
         model_cache = {}
 
         # --- 8. Reverse Diffusion Loop ---
+        print(f"DEBUG: Starting reverse diffusion loop for {len(reverse_schedule)} steps.")
         for step_i, (sigma_tm, sigma_t, gamma_val) in enumerate(reverse_schedule):
-            sigma_tm_val = sigma_tm.item()
-            sigma_t_val = sigma_t.item()
+            sigma_tm_val = sigma_tm.item() # Sigma at start of interval
+            sigma_t_val = sigma_t.item()   # Sigma at end of interval
             gamma_val_val = float(gamma_val)
+
+            # Effective sigma for input to the network (potentially adjusted by gamma)
             t_hat = sigma_tm_val * (1 + gamma_val_val)
+            # Sigma at the *end* of the interval (sigma_t_val) for calculating noise variance
+            sigma_next_step_val = sigma_t_val
 
-            step_sym_noise = self._symmetrical_noise(
-                 current_coords, feats, subunits, self.rot_mats_noI, t_hat, sigma_t_val
-            )
-            coords_noisy_step = current_coords + step_sym_noise
+            # --- Heun's 2nd order method or similar sampler logic ---
+            # a) Predict denoised state x_0_hat from current state x_tm
+            coords_input_to_denoiser = current_coords # Start with current state
 
-            # Note: network_condition_kwargs still contains the *original* input coords in feats['coords']
-            # if needed by the model, but r_noisy uses the *current* noisy coords.
-            denoised_coords, token_a = self.preconditioned_network_forward_symmetry(
-                coords_noisy=coords_noisy_step,
-                sigma=t_hat,
+            # The denoiser estimates x_0 based on input x_t at sigma=t_hat
+            denoised_coords_pred, token_a = self.preconditioned_network_forward_symmetry(
+                coords_noisy=coords_input_to_denoiser, # Pass current state
+                sigma=t_hat, # Use effective sigma for this step
                 network_condition_kwargs=dict(
                     multiplicity=multiplicity,
                     model_cache=model_cache if self.use_inference_model_cache else None,
-                     **network_condition_kwargs # Pass original kwargs, including feats with original coords
+                     **network_condition_kwargs # Pass original kwargs, including feats with reference coords
                 ),
                 training=False,
             )
 
-            # Apply symmetry constraints AFTER denoising
-            denoised_coords = self.apply_symmetry_constraints_rigid(
-                denoised_coords, subunits, self.rot_mats_noI, desired_com_final
+            # Apply symmetry constraints *immediately after* denoising prediction
+            denoised_coords_pred = self.apply_symmetry_constraints_rigid(
+                denoised_coords_pred,
+                subunits,
+                self.rot_mats_noI,
+                desired_com_final_A # Use the same target COM for A throughout
             )
 
-            # ODE step (simplified, assuming Euler-Maruyama like update derived from Karras)
-            # This part depends heavily on the specific sampler used (e.g., Heun, DPM-Solver++).
-            # Using a simplified update based on the denoised state for illustration:
-            # d = (current_coords - denoised_coords) / sigma_tm_val # Estimate score
-            # current_coords = current_coords + d * (sigma_t_val - sigma_tm_val) # Basic Euler step
 
-            # Alternative: Directly use the denoised coords as the next state (DDIM-like)
-            # This is often used in simpler implementations.
-            current_coords = denoised_coords
+            # b) Calculate derivative (score estimate) at x_tm
+            # d = (x_tm - x_0_hat) / sigma_tm
+            d = (current_coords - denoised_coords_pred) / sigma_tm_val
 
-            # Token accumulation logic remains the same
+            # c) Euler step to get intermediate state x_prime at sigma_t
+            # x_prime = x_tm + d * (sigma_t - sigma_tm)
+            dt = sigma_t_val - sigma_tm_val # Change in sigma (should be negative)
+            coords_intermediate = current_coords + d * dt
+
+            # Apply constraints to intermediate state
+            coords_intermediate = self.apply_symmetry_constraints_rigid(
+                coords_intermediate,
+                subunits,
+                self.rot_mats_noI,
+                desired_com_final_A
+            )
+
+
+            # d) Predict denoised state x_0_hat_prime from intermediate state x_prime
+            # Need to run network again with x_prime as input at sigma_t
+            if step_i < len(reverse_schedule) - 1 and sigma_t_val > self.sigma_min: # Avoid denoising at sigma=0 if using Heun
+                 t_hat_prime = sigma_t_val * (1 + gamma_val_val) # Use sigma_t for the second evaluation
+
+                 denoised_coords_prime, _ = self.preconditioned_network_forward_symmetry(
+                     coords_noisy=coords_intermediate, # Use intermediate state
+                     sigma=t_hat_prime, # Use sigma corresponding to intermediate state time
+                     network_condition_kwargs=dict(
+                         multiplicity=multiplicity,
+                         model_cache=model_cache if self.use_inference_model_cache else None,
+                         **network_condition_kwargs
+                     ),
+                     training=False,
+                 )
+
+                 # Apply symmetry constraints *immediately after* second denoising prediction
+                 denoised_coords_prime = self.apply_symmetry_constraints_rigid(
+                    denoised_coords_prime,
+                    subunits,
+                    self.rot_mats_noI,
+                    desired_com_final_A
+                 )
+
+
+                 # e) Calculate derivative at x_prime
+                 # d_prime = (x_prime - x_0_hat_prime) / sigma_t
+                 d_prime = (coords_intermediate - denoised_coords_prime) / sigma_t_val
+
+                 # f) Heun step (trapezoid rule average)
+                 # x_next = x_tm + 0.5 * (d + d_prime) * (sigma_t - sigma_tm)
+                 current_coords = current_coords + 0.5 * (d + d_prime) * dt
+
+            else: # Use Euler step for the last step or if sigma_t is very small
+                 current_coords = coords_intermediate # x_next = x_prime
+
+            # Final constraint application for the step
+            current_coords = self.apply_symmetry_constraints_rigid(
+                current_coords,
+                subunits,
+                self.rot_mats_noI,
+                desired_com_final_A
+            )
+
+            # --- Sampler step finished ---
+
+
+            # Token accumulation logic (remains the same)
             if self.accumulate_token_repr:
                 if token_repr is None:
                     token_repr = torch.zeros_like(token_a)
                 with torch.set_grad_enabled(train_accumulate_token_repr):
-                    t_tensor = torch.full((current_coords.shape[0],), t_hat, device=device, dtype=coords.dtype)
+                    t_tensor = torch.full((current_coords.shape[0],), t_hat, device=device, dtype=coords_ref.dtype)
                     token_repr = self.out_token_feat_update(
                         times=self.c_noise(t_tensor),
                         acc_a=token_repr,
-                        next_a=token_a,
+                        next_a=token_a, # Use token_a from the *first* prediction in the step
                     )
             elif step_i == len(reverse_schedule) - 1: # Get final token repr
                 token_repr = token_a
 
-        return {"sample_atom_coords": current_coords, "diff_token_repr": token_repr}
+        # 9. Final Output
+        print(f"DEBUG: Reverse diffusion finished.")
+        # Final constraint application just to be safe
+        final_coords = self.apply_symmetry_constraints_rigid(
+             current_coords, subunits, self.rot_mats_noI, desired_com_final_A
+        )
+
+        return {"sample_atom_coords": final_coords, "diff_token_repr": token_repr}
 
 
 
@@ -1145,63 +1225,105 @@ class AtomDiffusion(nn.Module):
     # ------------------------------------------------------
     # Hard-Constraint: re-rotate each subunit => R_i * reference
     # ------------------------------------------------------
+    # ------------------------------------------------------
+    # Hard-Constraint: re-rotate each subunit => R_i * reference
+    # ------------------------------------------------------
     def apply_symmetry_constraints_rigid(
         self,
-        coords: torch.Tensor,      # (B, A, 3)
-        subunits: list[torch.Tensor], # List of index tensors per subunit
-        rot_mats: torch.Tensor,      # Should be self.rot_mats_noI (N-1, 3, 3) or None
-        desired_com: torch.Tensor, # Target COM for the *reference* subunit (B, 1, 3)
+        coords: torch.Tensor,      # (B, A, 3) Current coordinates to be constrained
+        subunits: list[torch.Tensor], # List of index tensors per subunit (A, B, C, D, E, F...)
+        rot_mats: torch.Tensor,      # Effective rotation matrices (N-1, 3, 3) mapping centered A -> B, C, D... or None
+                                     # For 'I', this is dynamically calculated and averaged in sample()
+        desired_com_ref_subunit: torch.Tensor, # Target COM for the *reference* subunit (A) - Shape (B, 1, 3)
+                                               # For 'I', this is the COM of input subunit A
     ) -> torch.Tensor:
-        """ Applies rigid body symmetry constraints. """
+        """
+        Applies rigid body symmetry constraints by:
+        1. Translating the reference subunit (A) so its COM matches desired_com_ref_subunit.
+        2. Generating other subunits (B, C, ...) by applying the corresponding rotation
+           from rot_mats to the *re-centered* reference subunit coordinates.
+
+        Args:
+            coords: Current coordinates (B, A, 3).
+            subunits: List of tensors, each holding atom indices for a subunit (A, B, C...).
+            rot_mats: Rotation matrices (N-1, 3, 3) to apply to centered ref subunit A
+                      to generate subunits B, C, D.... Should be None for monomer/no symmetry.
+            desired_com_ref_subunit: Target COM for the reference subunit (A) (B, 1, 3).
+
+        Returns:
+            Constrained coordinates (B, A, 3).
+        """
         device = coords.device
         dtype = coords.dtype
         B = coords.shape[0]
 
-        if not subunits: # Handle no subunits (e.g., monomer) - just center globally
-             com_global = coords.mean(dim=1, keepdim=True) # (B, 1, 3)
-             shift = desired_com - com_global # desired_com might be origin or avg coords
+        # Handle cases with no subunits (e.g., monomer) or missing desired COM
+        if not subunits or desired_com_ref_subunit is None:
+             # Default behavior: Center the whole structure globally if desired COM not provided,
+             # otherwise assume single chain and center it.
+             if desired_com_ref_subunit is None:
+                 com_global = calculate_com(coords).unsqueeze(1) # (B, 1, 3)
+                 desired_com_ref_subunit = torch.zeros_like(com_global) # Center at origin by default
+                 print("Warning: desired_com_ref_subunit not provided to constraint fn. Centering globally.")
+
+             # If subunits exist but desired_com is None, use the first subunit for centering
+             if subunits and desired_com_ref_subunit is None:
+                  com_current = calculate_com(coords[:, subunits[0], :]).unsqueeze(1)
+             else: # Global centering
+                  com_current = calculate_com(coords).unsqueeze(1)
+
+             shift = desired_com_ref_subunit - com_current # (B, 1, 3)
              return coords + shift
 
         out_coords = coords.clone()
 
-        # Ensure desired_com has correct shape and device/dtype
-        if desired_com.shape != (B, 1, 3):
-             raise ValueError(f"desired_com shape mismatch: Expected {(B, 1, 3)}, Got {desired_com.shape}")
-        desired_com = desired_com.to(device, dtype)
+        # Ensure desired_com_ref_subunit has correct shape and device/dtype
+        if desired_com_ref_subunit.shape != (B, 1, 3):
+             # Attempt to fix common shape issues (e.g., (B, 3))
+             if desired_com_ref_subunit.shape == (B, 3):
+                 desired_com_ref_subunit = desired_com_ref_subunit.unsqueeze(1)
+             else:
+                 raise ValueError(f"desired_com_ref_subunit shape mismatch: Expected {(B, 1, 3)}, Got {desired_com_ref_subunit.shape}")
+        desired_com_ref_subunit = desired_com_ref_subunit.to(device, dtype)
 
         # 1. Center the reference subunit (A, index 0) to its desired COM
         ref_inds = subunits[0]
         if ref_inds.numel() == 0: # Handle empty reference subunit
-            print("Warning: Reference subunit has no atoms.")
-            # If no ref atoms, we can't really apply symmetry based on it. Return unconstrained.
-            # Or maybe center globally? Let's return for now.
-            return out_coords
+            print("Warning in apply_symmetry_constraints_rigid: Reference subunit (A) has no atoms. Returning unconstrained coords.")
+            return out_coords # Cannot proceed without reference atoms
 
-        # Calculate current COM of reference subunit for each batch item
-        # Need a mask if atoms can be padded within a subunit - assume no padding *within* subunit indices for now
+        # Calculate current COM of reference subunit (A) for each batch item
+        # Assuming no padding *within* subunit indices provided by get_subunit_atom_indices
         com_ref_current = calculate_com(out_coords[:, ref_inds, :]) # (B, 3)
-        shift = desired_com.squeeze(1) - com_ref_current             # (B, 3) - (B, 3) -> (B, 3)
+        # Calculate shift needed: Target COM - Current COM
+        shift = desired_com_ref_subunit.squeeze(1) - com_ref_current # (B, 3) - (B, 3) -> (B, 3)
 
         # Apply shift to reference subunit atoms
         # Expand shift for broadcasting: (B, 1, 3)
         out_coords[:, ref_inds, :] = out_coords[:, ref_inds, :] + shift.unsqueeze(1)
-        # Store the re-centered reference coordinates for rotations
+
+        # Store the re-centered reference coordinates for subsequent rotations
         ref_coords_centered = out_coords[:, ref_inds, :] # (B, n_atoms_ref, 3)
 
 
         # 2. Generate other subunits by rotating the centered reference subunit
-        # Skip if only one subunit or no rotations defined
+        # Skip if only one subunit or no rotation matrices are defined
         if len(subunits) > 1 and rot_mats is not None:
             rot_mats = rot_mats.to(device, dtype) # Ensure device/dtype
 
+            if rot_mats.shape[0] < len(subunits) - 1:
+                print(f"Warning in apply_symmetry_constraints_rigid: Mismatch between number of rotation matrices ({rot_mats.shape[0]}) and number of non-reference subunits ({len(subunits) - 1}). Constraining only available subunits.")
+
             for i_sub in range(1, len(subunits)):
                 target_inds = subunits[i_sub]
-                if target_inds.numel() == 0: continue # Skip empty target subunits
+                if target_inds.numel() == 0:
+                    # print(f"Debug: Skipping empty target subunit {i_sub}.")
+                    continue # Skip empty target subunits
 
                 rot_idx = i_sub - 1 # Index into rot_mats (for B, C, D...)
                 if rot_idx >= rot_mats.shape[0]:
-                     print(f"Warning: Not enough rotation matrices for subunit {i_sub}. Skipping constraint.")
-                     continue
+                     # This handles the mismatch warning above - stop when out of matrices
+                     break
 
                 R = rot_mats[rot_idx] # Get the appropriate rotation (3, 3)
 
@@ -1209,17 +1331,30 @@ class AtomDiffusion(nn.Module):
                 # R needs to be applied per batch element if ref_coords_centered is batched.
                 # R is currently (3, 3), ref_coords_centered is (B, n_atoms_ref, 3)
                 # We need (B, n_atoms_ref, 3) @ (3, 3) -> (B, n_atoms_ref, 3) using batch matmul logic via einsum
+                # Einsum: 'bni,ij->bnj' where b=batch, n=atoms, i/j=coords/matrix dims
+                try:
+                    rotated_coords = torch.einsum('bni,ij->bnj', ref_coords_centered, R.T) # R.T is (3, 3)
+                except RuntimeError as e:
+                     print(f"Error during einsum rotation in apply_symmetry_constraints_rigid: {e}")
+                     print(f"Shapes: ref_coords_centered={ref_coords_centered.shape}, R.T={R.T.shape}")
+                     # Fallback or re-raise? Let's return unconstrained for safety.
+                     return coords
 
-                rotated_coords = torch.einsum('bni,ij->bnj', ref_coords_centered, R.T) # R.T is (3, 3)
 
-                # Check if number of atoms matches (should if mapping is correct)
+                # Check if number of atoms matches between reference and target subunit
+                # This is crucial for direct assignment.
                 if rotated_coords.shape[1] != len(target_inds):
-                     print(f"Warning: Atom count mismatch for subunit {i_sub}. Ref: {rotated_coords.shape[1]}, Target: {len(target_inds)}. Skipping assignment.")
-                     # This indicates an issue with get_symmetrical_atom_mapping or subunit definitions
-                     continue
+                     print(f"Warning in apply_symmetry_constraints_rigid: Atom count mismatch for subunit {i_sub}. "
+                           f"Reference subunit (A) has {rotated_coords.shape[1]} atoms, "
+                           f"Target subunit has {len(target_inds)} atoms. "
+                           f"Skipping assignment for this subunit. Check 'get_subunit_atom_indices' and 'get_symmetrical_atom_mapping'.")
+                     continue # Skip assignment for this problematic subunit
 
-                # Assign rotated coordinates to the target subunit
+                # Assign rotated coordinates to the target subunit atoms
                 out_coords[:, target_inds, :] = rotated_coords
+        elif len(subunits) > 1 and rot_mats is None:
+             print(f"Warning in apply_symmetry_constraints_rigid: Multiple subunits ({len(subunits)}) detected, but rot_mats is None. Only centering reference subunit.")
+
 
         return out_coords
 
