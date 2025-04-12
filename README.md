@@ -28,6 +28,9 @@ Add: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/data
 ## example_boltz_symmetry_test.sh
 Use this file as an example. However, importantly, the setup file generates an accurate yaml. So you can simply use this. Be wary, as this will require changes to the shell script, as you need to call a different yaml if you want to automate this. 
 
+## symmetry_postprocess.py
+This is a general postprocessing script to create the full subquotient icosahedron. Note that this will only use chain A of the input file to create said icosahedron. The way to run the script is as follows: 'python symmetry_postprocess.py <input_name>.cif <output_name>.cif --group I'
+
 ## RMSD calculation
 Yang TO DO
 
