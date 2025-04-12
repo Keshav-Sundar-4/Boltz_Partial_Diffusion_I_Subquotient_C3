@@ -8,7 +8,7 @@ pip install matplotlib
 
 # File Replacements:
 
-Note that these file paths are based on the Filezilla boltz env folder. I believe they are general, but am not completely sure. 
+Note that these file paths are based on the Filezilla boltz env folder. 
 
 ## main.py
 Replace: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/main.py
