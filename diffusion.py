@@ -757,6 +757,7 @@ class AtomDiffusion(nn.Module):
         Uses the Karras-like sampling schedule with gamma term (Old Logic).
 
         ** COMBINED: New symmetry setup/constraints + Old sampling schedule/loop **
+        ** MODIFIED: Uses I/C3 pseudo-quotient search for A->D rotation **
         """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
@@ -868,29 +869,31 @@ class AtomDiffusion(nn.Module):
 
 
         # ======= Calculate Rotations for Symmetrical Noise/Denoising (New Logic) =======
-        # === MODIFICATION: Calculate I/C3 inter-trimer rotation directly ===
+        # === MODIFICATION: Calculate I/C3 inter-trimer rotation using pseudo-quotient search ===
         self.rot_mats_noI = None # Reset instance variable
 
         if self.symmetry_type == 'I' and n_subunits_found >= 6:
-            print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (Direct Calculation)")
+            print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (Pseudo-Quotient Search)")
 
             if target_coms_all is None or target_coms_all.shape[1] < 6:
                  print("Warning: Insufficient target COMs found for I symmetry rotation calculation. Symmetrical noise/denoising might be incorrect.")
                  self.rot_mats_noI = None
             else:
                 # Select COMs for rotation calculation (all shape: n_batches, 3)
-                com_A_ref = target_coms_all[:, 0, :]
-                com_B_ref = target_coms_all[:, 1, :]
-                com_C_ref = target_coms_all[:, 2, :]
-                com_D_ref = target_coms_all[:, 3, :] # Needed for direct A->D vector
+                com_A_ref = target_coms_all[:, 0, :] # Subunit A
+                com_B_ref = target_coms_all[:, 1, :] # Subunit B
+                com_C_ref = target_coms_all[:, 2, :] # Subunit C
+                com_D_ref = target_coms_all[:, 3, :] # Subunit D (Target for A->D rotation)
+                # com_E_ref = target_coms_all[:, 4, :] # Subunit E
+                # com_F_ref = target_coms_all[:, 5, :] # Subunit F
 
                 # Ensure subunits list is correct length before indexing
                 if len(subunits) < 6:
                     raise IndexError(f"Subunits list has length {len(subunits)}, expected at least 6 for I symmetry rotation calculation.")
 
-                trimer1_indices = torch.cat(subunits[:3])
-                trimer2_indices = torch.cat(subunits[3:6])
-                # Recalculate Trimer COMs (using all batch elements)
+                # --- Calculate Trimer COMs ---
+                trimer1_indices = torch.cat(subunits[:3]) # A, B, C
+                trimer2_indices = torch.cat(subunits[3:6]) # D, E, F
                 com_ABC_ref = calculate_com(coords_ref[:, trimer1_indices, :]) # (n_batches, 3)
                 com_DEF_ref = calculate_com(coords_ref[:, trimer2_indices, :]) # (n_batches, 3)
 
@@ -899,30 +902,49 @@ class AtomDiffusion(nn.Module):
                 vec_B_rel = com_B_ref - com_ABC_ref # (n_batches, 3)
                 vec_C_rel = com_C_ref - com_ABC_ref # (n_batches, 3)
 
+                # Note: compute_rotation_matrix_from_vectors handles batches
                 R_B_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_B_rel, device=device, dtype=coords_ref.dtype)
                 R_C_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_C_rel, device=device, dtype=coords_ref.dtype)
+                # Result shapes: (n_batches, 3, 3)
 
-                # --- Calculate Rotation BETWEEN Trimers (A->D, Direct) ---
-                vec_D_rel = com_D_ref - com_DEF_ref # (n_batches, 3)
-                R_I_sub_C3_batch = compute_rotation_matrix_from_vectors(
-                    vec_A_rel, vec_D_rel, device=device, dtype=coords_ref.dtype
+                # --- Calculate Inter-Trimer Rotation (A->D) using I/C3 Pseudo-Quotient Search ---
+                # Regenerate I/C3 rotations from scratch
+                print("DEBUG: Regenerating I/C3 pseudo-quotient matrices within sample()...")
+                IsubC3_rots = symmetry.get_pseudoquotient('I', 'C_3') # Shape (N_rots, 3, 3), N_rots=20
+                IsubC3_rots = IsubC3_rots.to(device, coords_ref.dtype)
+                print(f"DEBUG: Regenerated I/C3 matrices. Shape: {IsubC3_rots.shape}, Device: {IsubC3_rots.device}, Dtype: {IsubC3_rots.dtype}")
+
+                # Calculate the target vector for A: D relative to trimer DEF
+                vec_D_target_rel = com_D_ref - com_DEF_ref # (n_batches, 3)
+
+                # Find the best I/C3 rotation that maps vec_A_rel closest to vec_D_target_rel
+                print(f"DEBUG: Finding best I/C3 rotation: Target shape={vec_D_target_rel.shape}, Candidates={IsubC3_rots.shape}, Ref point shape={vec_A_rel.shape}")
+                R_I_sub_C3_batch = find_best_rotation_point_cloud(
+                    target_point=vec_D_target_rel,       # (B, 3)
+                    candidate_rots=IsubC3_rots,          # (N_rots, 3, 3)
+                    ref_point=vec_A_rel                  # (B, 3)
                 ) # Returns (n_batches, 3, 3)
-                print(f"DEBUG: Calculated inter-trimer rotation R_I_sub_C3 directly. Shape: {R_I_sub_C3_batch.shape}")
+                print(f"DEBUG: Found best inter-trimer rotation R_I_sub_C3 (A->D) via search. Shape: {R_I_sub_C3_batch.shape}")
 
                 # Select the rotation for the first batch item -> (3, 3) for stacking
                 if n_batches != 1:
                      print(f"WARNING: Batch size is {n_batches}, but extracting only the first rotation for self.rot_mats_noI used in noise/denoising.")
                 R_B = R_B_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
                 R_C = R_C_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
-                R_I_sub_C3 = R_I_sub_C3_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
+                R_I_sub_C3 = R_I_sub_C3_batch[0] # Use the rotation found via search
 
                 # --- Combine rotations for A->E, A->F (using compositions) ---
-                R_E = R_I_sub_C3 @ R_B
-                R_F = R_I_sub_C3 @ R_C
+                # R_E = R_I_sub_C3 @ R_B # Original logic
+                # R_F = R_I_sub_C3 @ R_C # Original logic
+                # Need to recalculate R_E, R_F properly? Assume A->E is R_I_sub_C3 @ R_B, A->F is R_I_sub_C3 @ R_C
+                # This assumes the I/C3 maps A->D, B->E, C->F.
+                R_E = torch.matmul(R_I_sub_C3, R_B)
+                R_F = torch.matmul(R_I_sub_C3, R_C)
+
 
                 effective_rots = [ R_B, R_C, R_I_sub_C3, R_E, R_F ]
                 self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, coords_ref.dtype) # Shape [5, 3, 3]
-                print(f"DEBUG: Calculated effective rotations for noise/denoising (Direct I/C3). Shape: {self.rot_mats_noI.shape}")
+                print(f"DEBUG: Calculated effective rotations for noise/denoising using I/C3 search. Shape: {self.rot_mats_noI.shape}")
 
         elif self.symmetry_type and n_subunits_found > 1:
              print(f"DEBUG: Using precomputed {self.symmetry_type} rotations from __init__ for noise/denoising.")
@@ -1068,6 +1090,8 @@ class AtomDiffusion(nn.Module):
         )
 
         return {"sample_atom_coords": final_coords, "diff_token_repr": token_repr}
+
+
 
 
 
