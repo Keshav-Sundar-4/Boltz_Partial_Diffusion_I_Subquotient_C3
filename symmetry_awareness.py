@@ -758,6 +758,258 @@ def reorder_point_group(
 
     return G_reordered
 
+
+# --- NEW FUNCTION ---
+def get_pseudoquotient_operators_transformed_numpy_style(
+    G_name: str = 'I',
+    G_div_name: str = 'C_3',
+    device: torch.device = torch.device('cpu'), # Device for the final output tensor
+    dtype: torch.dtype = torch.float64 # Dtype for the final output tensor
+) -> torch.Tensor:
+    """
+    Calculates the I/C3 pseudo-quotient representatives *in the transformed
+    (C3-aligned) frame* using NumPy linalg for numerical consistency with
+    symmetry_postprocess.py.
+
+    Args:
+        G_name (str): Parent group name (must be 'I').
+        G_div_name (str): Subgroup name (must be 'C_3').
+        device (torch.device): The desired device for the output tensor.
+        dtype (torch.dtype): The desired dtype for the output tensor.
+
+    Returns:
+        torch.Tensor: A tensor of shape (20, 3, 3) containing the 20
+                      transformed pseudo-quotient operators (g'_i), sorted
+                      lexicographically, on the specified device and dtype.
+                      Returns empty tensor on failure.
+    """
+    if not (G_name == 'I' and G_div_name == 'C_3'):
+        raise NotImplementedError(f"Pseudoquotient calculation implemented only for I / C_3.")
+
+    # Use a cache key specific to this NumPy-style calculation output
+    cache_key = f"I_sub_C3_transformed_numpy_style_{dtype}"
+    if cache_key in _point_group_cache:
+        print(f"DEBUG: Using cached transformed I/C3 operators (NumPy style).")
+        # Ensure cached tensor is returned on the correct device
+        return _point_group_cache[cache_key].to(device)
+
+    print(f"DEBUG: Calculating transformed I/C3 operators (NumPy style)...")
+    internal_np_dtype = np.float64 # Use float64 for NumPy calculations
+
+    # 1. Get Groups as NumPy arrays using float64
+    try:
+        G_np = _calculate_full_icosahedral_matrices_numpy().astype(internal_np_dtype)
+
+        # Get C3 group using NumPy directly
+        n_div = 3
+        G_div_np = []
+        for ri in range(n_div):
+            angle = ri * 2.0 * math.pi / n_div
+            cos_phi = math.cos(angle)
+            sin_phi = math.sin(angle)
+            g = np.array(
+                [[cos_phi, -sin_phi, 0.0], [sin_phi, cos_phi, 0.0], [0.0, 0.0, 1.0]],
+                dtype=internal_np_dtype
+            )
+            G_div_np.append(g)
+        G_div_np = np.array(G_div_np)
+
+    except Exception as e:
+        print(f"ERROR: Failed to get base groups as NumPy arrays: {e}")
+        return torch.empty((0, 3, 3), device=device, dtype=dtype)
+
+
+    N = G_np.shape[0]      # 60
+    n_div = G_div_np.shape[0] # 3
+
+    # 2. Find Alignment Rotation (W) and Inverse (W_inv) using NumPy
+    target_trace = 2 * np.cos(2 * np.pi / n_div) + 1 # Should be 0.0 for C3
+    traces = np.trace(G_np, axis1=1, axis2=2)
+    trace_tolerance = 1e-5 # Match tolerance
+    indices_equal_theta = np.where(np.abs(traces - target_trace) < trace_tolerance)[0]
+
+    if indices_equal_theta.size == 0:
+        print(f"ERROR: No element found in G_np matching C3 trace ({target_trace:.3f} +/- {trace_tolerance}). Traces found: {traces}")
+        raise RuntimeError(f"Cannot find C3 element in Icosahedral group by trace.")
+    idx_equal_theta = indices_equal_theta[0]
+    g_theta = G_np[idx_equal_theta]        # A C3 rotation from the I group
+    g_div_gen = G_div_np[1]                # The canonical 120-degree C3 rotation
+
+    print(f"DEBUG: Using element G_np[{idx_equal_theta}] (trace {traces[idx_equal_theta]:.5f}) to align with canonical C3.")
+
+    try:
+        # Compute eigenvectors/values for alignment using NumPy
+        L_div_np, V_div_np = np.linalg.eig(g_div_gen)
+        L_np, V_np = np.linalg.eig(g_theta)
+
+        # Calculate W = V_div @ V_inv using NumPy pinv
+        V_inv_np = np.linalg.pinv(V_np)
+        W_np = np.matmul(V_div_np, V_inv_np)
+
+        # Check and handle complex part
+        if np.max(np.abs(W_np.imag)) > trace_tolerance:
+             print(f"Warning: Alignment matrix W_np has significant imaginary component: {np.max(np.abs(W_np.imag)):.2e}. Using real part.")
+        W_np = W_np.real # Take real part
+
+        # Calculate W_inv_np using NumPy pinv or transpose
+        identity_3x3_np = np.eye(3, dtype=internal_np_dtype)
+        if np.allclose(np.matmul(W_np, W_np.T), identity_3x3_np, atol=1e-4): # Match tolerance
+             W_inv_np = W_np.T
+             # print("DEBUG: Alignment matrix W_np appears orthogonal. Using transpose for inverse.")
+        else:
+             print(f"[Warning] W_np is not orthogonal (max diff from I: {np.max(np.abs(np.matmul(W_np, W_np.T) - identity_3x3_np)):.2e}). Using pseudo-inverse for W_inv_np.")
+             try:
+                 W_inv_np = np.linalg.pinv(W_np)
+                 if not np.allclose(np.matmul(W_inv_np, W_np), identity_3x3_np, atol=1e-4):
+                     print("[Warning] Pseudo-inverse W_inv_np may be inaccurate.")
+             except np.linalg.LinAlgError as e_pinv:
+                 print(f"ERROR: np.linalg.pinv(W_np) failed: {e_pinv}. Falling back to W_np.T")
+                 W_inv_np = W_np.T # Fallback
+
+    except np.linalg.LinAlgError as e:
+        print(f"ERROR: NumPy linalg computation failed during alignment: {e}")
+        raise RuntimeError(f"Could not compute alignment matrix W_np: {e}")
+
+    # 3. Transform G to the Canonical (C3-aligned) Frame using NumPy matmul
+    # G_transformed = W @ G @ W_inv
+    G_transformed_np = np.einsum('ij,gjk,kl->gil', W_np, G_np, W_inv_np, optimize=True)
+    # print(f"DEBUG: Successfully transformed {G_transformed_np.shape[0]} matrices to canonical frame (NumPy).")
+
+    # 4. Identify Coset Representatives in the Transformed Space using NumPy
+    representatives_transformed_np = []
+    processed_indices = set()
+    distance_tolerance = 1e-4 # Match tolerance
+
+    # print("DEBUG: Identifying cosets in transformed space (NumPy)...")
+    num_cosets_found = 0
+    for i in range(N): # Iterate through indices 0 to 59
+        if i in processed_indices:
+            continue
+
+        num_cosets_found += 1
+        rep_i_transformed = G_transformed_np[i]
+        representatives_transformed_np.append(rep_i_transformed)
+        processed_indices.add(i)
+
+        for k in range(1, n_div): # Look for elements related by G_div_np[1], G_div_np[2]
+            target_mat = np.matmul(rep_i_transformed, G_div_np[k])
+            min_dist = np.inf
+            best_match_idx = -1
+
+            for j in range(N):
+                if j not in processed_indices:
+                    dist = np.linalg.norm(G_transformed_np[j] - target_mat)
+                    if dist < distance_tolerance and dist < min_dist:
+                        min_dist = dist
+                        best_match_idx = j
+
+            if best_match_idx != -1:
+                processed_indices.add(best_match_idx)
+            # else: # Optional warning if match not found (already present in original code)
+            #     min_dist_overall = np.inf
+            #     # ... (code to find minimum distance if needed for debugging) ...
+            #     print(f"Warning: Could not find exact match (tol={distance_tolerance:.1e}) for rep idx {i} with G_div_np[{k}]. Closest dist: {min_dist_overall:.2e}")
+
+
+    # print(f"DEBUG: Coset identification loop finished (NumPy). Found {len(representatives_transformed_np)} representatives.")
+
+    if not representatives_transformed_np:
+        print("ERROR: No representatives found (NumPy calculation)!")
+        return torch.empty((0, 3, 3), device=device, dtype=dtype)
+
+    # Stack the representatives found in the transformed space
+    G_quot_transformed_np = np.array(representatives_transformed_np) # Shape (expected 20, 3, 3)
+
+    expected_size = N // n_div # 20
+    if G_quot_transformed_np.shape[0] != expected_size:
+        print(f"ERROR: Expected {expected_size} pseudoquotient matrices, found {G_quot_transformed_np.shape[0]} (NumPy calculation).")
+        return torch.empty((0, 3, 3), device=device, dtype=dtype)
+    # else:
+        # print(f"DEBUG: Found correct number ({G_quot_transformed_np.shape[0]}) of transformed representatives (NumPy).")
+
+    # 5. Sort the *transformed* representatives lexicographically using NumPy
+    try:
+        sort_key_np = np.round(G_quot_transformed_np.reshape(expected_size, -1), decimals=5)
+        sorted_indices = np.lexsort(sort_key_np.T)
+        G_quot_transformed_sorted_np = G_quot_transformed_np[sorted_indices]
+        # print("DEBUG: Sorted transformed representatives lexicographically (NumPy).")
+    except Exception as sort_err:
+        print(f"Warning: Sorting failed ({sort_err}). Using unsorted transformed representatives.")
+        G_quot_transformed_sorted_np = G_quot_transformed_np
+
+    # 6. Convert the final NumPy array to a PyTorch Tensor with desired dtype and device
+    final_ops_tensor = torch.from_numpy(G_quot_transformed_sorted_np).to(device=device, dtype=dtype)
+
+    # Cache the result before returning
+    _point_group_cache[cache_key] = final_ops_tensor
+    print(f"DEBUG: Successfully calculated and cached {final_ops_tensor.shape[0]} transformed I/C3 operators (NumPy style).")
+
+    return final_ops_tensor
+
+
+def _calculate_full_icosahedral_matrices_numpy(tree_depth: int = 5) -> np.ndarray:
+    """
+    Generates the 60 rotation matrices for the Icosahedral group (I)
+    using generators and group multiplication, returning NumPy array.
+    (Essentially the NumPy logic from symmetry_postprocess.py)
+    """
+    # Check cache first (optional, can rely on get_I_rotations cache)
+    # cache_key = "I_full_60_numpy"
+    # if cache_key in _point_group_cache:
+    #     return _point_group_cache[cache_key]
+
+    TAU_np = 0.5 * (1 + np.sqrt(5))
+    generator_1 = np.array([[-1.0, 0.0, 0.0],
+                            [0.0, -1.0, 0.0],
+                            [0.0, 0.0, 1.0]], dtype=np.float64)
+    generator_2 = np.array([[0.0, 0.0, 1.0],
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0]], dtype=np.float64)
+    generator_3 = np.array([[0.5, -0.5 * TAU_np, 0.5 / TAU_np],
+                            [0.5 * TAU_np, 0.5 / TAU_np, -0.5],
+                            [0.5 / TAU_np, 0.5, 0.5 * TAU_np]], dtype=np.float64)
+    generators = [generator_1, generator_2, generator_3]
+    matrices = set()
+    identity_np = np.eye(3, dtype=np.float64)
+    matrices.add(tuple(identity_np.flatten()))
+
+    current_set_matrices = [identity_np]
+
+    for _ in range(tree_depth + 2): # Match iterations
+        new_products_set = set()
+        next_set_matrices = []
+        num_before = len(matrices)
+
+        for mat in current_set_matrices:
+            for gen in generators:
+                product_mat = np.round(mat @ gen, decimals=6) # Use numpy matmul
+                product_tuple = tuple(product_mat.flatten())
+                if product_tuple not in matrices:
+                    matrices.add(product_tuple)
+                    new_products_set.add(product_tuple)
+                    # Store the matrix itself for the next iteration
+                    next_set_matrices.append(product_mat)
+
+        current_set_matrices.extend(next_set_matrices) # Add newly generated matrices
+        if len(matrices) == num_before or len(matrices) >= 60:
+            break
+
+    # Convert unique tuples back to matrices
+    mats_list = [np.array(m).reshape(3, 3) for m in matrices]
+    final_ops = np.array(mats_list)
+
+    if final_ops.shape[0] != 60:
+         print(f"[Warning symmetry_awareness] Expected 60 I matrices, got {final_ops.shape[0]}.")
+
+    # Sort lexicographically based on rounded values
+    sort_key = np.round(final_ops.reshape(final_ops.shape[0], -1), decimals=5)
+    sorted_indices = np.lexsort(sort_key.T)
+    final_ops_sorted = final_ops[sorted_indices]
+
+    # _point_group_cache[cache_key] = final_ops_sorted # Optional cache
+    return final_ops_sorted
+
+
 # --- Functions removed as they seem unused based on the request ---
 # def subsample(...)
 # def symmetrize_XCS(...)
