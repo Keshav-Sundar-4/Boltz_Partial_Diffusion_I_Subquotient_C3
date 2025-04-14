@@ -745,360 +745,312 @@ class AtomDiffusion(nn.Module):
         self,
         atom_mask,
         num_sampling_steps=None,
-        forward_diffusion_steps=100,  # Determines start_sigma (used by old logic)
+        forward_diffusion_steps=100,
         multiplicity=1,
         train_accumulate_token_repr=False,
+        output_dir: str = ".", # Add output_dir for saving temp file
         **network_condition_kwargs,
     ):
         """
         Performs reverse diffusion sampling with rigid symmetry enforcement.
-        Constraints force subunit COMs to match input reference COMs (New Logic).
-        Calculated rotations are used ONLY for noise/denoising symmetrization (New Logic).
-        Uses the Karras-like sampling schedule with gamma term (Old Logic).
-
-        ** COMBINED: New symmetry setup/constraints + Old sampling schedule/loop **
-        ** MODIFIED: Uses I/C3 pseudo-quotient search for A->D rotation **
+        MODIFIED for Icosahedral ('I'): Uses the IDEAL A->D rotation derived
+        by matching input subunits A and D to a generated template based on input A.
         """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
         n_batches = atom_mask.shape[0] # Total batches *after* multiplicity
         n_atoms = atom_mask.shape[1]
         device = self.device
+        dtype = next(self.score_model.parameters()).dtype # Get dtype from model
         feats = network_condition_kwargs.get("feats", {})
 
-        # 1. Get Input Coordinates (CLEAN) - The Reference Structure (New Logic)
+        # 1. Get Input Coordinates (CLEAN) - The Reference Structure
         input_coords_ref = network_condition_kwargs.get("input_coords", None)
         if input_coords_ref is None:
-             input_coords_ref = feats.get("coords", None)
-             if input_coords_ref is None:
-                 raise ValueError("Reference coordinates must be provided either via 'input_coords' kwarg or in 'feats'.")
+                input_coords_ref = feats.get("coords", None)
+                if input_coords_ref is None:
+                    raise ValueError("Reference coordinates must be provided either via 'input_coords' kwarg or in 'feats'.")
 
         # Determine original batch size (B_ref) before applying multiplicity
         if input_coords_ref.ndim == 4: # Reshape if needed (B, N_res, L_atom, 3) -> (B, A, 3)
-             B_ref, N_, L_, _ = input_coords_ref.shape # Assign B_ref here
-             print(f"DEBUG: Input coords ndim=4. Reshaping from {input_coords_ref.shape}...")
-             input_coords_ref = input_coords_ref.reshape(B_ref, N_*L_, 3)
-             print(f"DEBUG: Reshaped input coords to {input_coords_ref.shape}.")
+                B_ref, N_, L_, _ = input_coords_ref.shape # Assign B_ref here
+                input_coords_ref = input_coords_ref.reshape(B_ref, N_*L_, 3)
         elif input_coords_ref.ndim == 3: # Assume shape (B, A, 3)
-             B_ref = input_coords_ref.shape[0] # ***** FIX: Assign B_ref here *****
-             print(f"DEBUG: Input coords ndim=3. Shape: {input_coords_ref.shape}. Original B_ref={B_ref}.")
+                B_ref = input_coords_ref.shape[0]
         else:
             raise ValueError(f"Unexpected input_coords dimension: {input_coords_ref.ndim}. Expected 3 or 4.")
 
-        # Check batch size consistency before repeat_interleave
         if B_ref * multiplicity != n_batches:
-             raise ValueError(f"Input coords batch size {B_ref} * multiplicity {multiplicity} != atom_mask total batch size {n_batches}.")
+                raise ValueError(f"Input coords batch size {B_ref} * multiplicity {multiplicity} != atom_mask total batch size {n_batches}.")
 
-        # Apply multiplicity AFTER determining B_ref
         input_coords_ref = input_coords_ref.repeat_interleave(multiplicity, 0)
-        print(f"DEBUG: Input coords after repeat_interleave({multiplicity}): {input_coords_ref.shape}")
+        try:
+            input_coords_ref = input_coords_ref.view(n_batches, n_atoms, 3)
+        except RuntimeError as e:
+            raise ValueError(f"Input coordinates shape {input_coords_ref.shape} is incompatible with expected ({n_batches}, {n_atoms}, 3) after multiplicity. Error: {e}")
 
-
-        # Final shape check after repeat_interleave
-        if input_coords_ref.shape != (n_batches, n_atoms, 3):
-             try:
-                 input_coords_ref = input_coords_ref.view(n_batches, n_atoms, 3)
-             except RuntimeError as e:
-                 raise ValueError(f"Input coordinates shape {input_coords_ref.shape} is incompatible with expected ({n_batches}, {n_atoms}, 3) after multiplicity. Error: {e}")
-
-        coords_ref = input_coords_ref.clone().to(device).float() # Use this for deriving constraints
+        coords_ref = input_coords_ref.clone().to(device, dtype) # Use this for deriving constraints
         network_condition_kwargs["feats"]["coords"] = coords_ref # Update feats with the reference coords
         feats = network_condition_kwargs["feats"] # Update local feats reference
 
-        # Get atom indices for each subunit. (New Logic)
+        # 2. Get Atom Indices for Each Subunit
         subunits = symmetry.get_subunit_atom_indices(
             self.symmetry_type, self.chain_symmetry_groups, feats, device
         )
         n_subunits_found = len(subunits)
+        print(f"DEBUG: Found {n_subunits_found} subunits based on symmetry type '{self.symmetry_type}' and chain groups.")
 
-        # ------- Calculate Initial & **TARGET** COMs from Reference (New Logic) -------
-        print("\n" + "="*20 + " DIAGNOSTIC: Initial/Target COMs (Input Structure) " + "="*20)
-        b_idx_diag = 0 # Assuming Batch=1 for detailed printout clarity
-        initial_coms = {} # For diagnostics only
-        target_coms_list = [] # To store target COMs for the constraint function (B, 3) tensors
-
+        # 3. Calculate TARGET COMs from INPUT Reference (coords_ref)
+        target_coms_list = []
         if subunits:
-             for i_sub, sub_inds in enumerate(subunits):
-                 sub_name = chr(ord('A') + i_sub) # Simple naming A, B, C...
-                 if sub_inds.numel() > 0:
-                      # Calculate COM for all batch elements -> Shape (B, 3), B=n_batches here
-                      com_ref_sub = calculate_com(coords_ref[:, sub_inds, :])
-                      target_coms_list.append(com_ref_sub) # Add the (n_batches, 3) tensor
+                for i_sub, sub_inds in enumerate(subunits):
+                    if sub_inds.numel() > 0:
+                            com_ref_sub = calculate_com(coords_ref[:, sub_inds, :])
+                            target_coms_list.append(com_ref_sub)
+                    else:
+                        print(f"Warning: Subunit {i_sub} has 0 atoms.")
+                        target_coms_list.append(torch.zeros((n_batches, 3), device=device, dtype=dtype)) # Placeholder COM
 
-                      # Diagnostics for batch 0
-                      if b_idx_diag < n_batches:
-                           com_ref_sub_diag = com_ref_sub[b_idx_diag].cpu().numpy()
-                           initial_coms[sub_name] = com_ref_sub_diag # Store numpy array for diagnostics
-                           print(f"Batch {b_idx_diag} - Input/Target COM {sub_name}: {com_ref_sub_diag}")
-                      else: pass # No diagnostics if b_idx_diag out of range
-
-                 else:
-                     print(f"Batch {b_idx_diag} - Warning: Subunit {sub_name} (index {i_sub}) is empty.")
-                     # Add placeholder if needed for tensor stacking consistency
-                     target_coms_list.append(torch.zeros((n_batches, 3), device=device, dtype=coords_ref.dtype))
-
-             if not target_coms_list or all(sub_inds.numel()==0 for sub_inds in subunits): # Check if list is empty or all subunits were empty
-                  print(f"Batch {b_idx_diag} - No non-empty subunits found. Cannot define target COMs from subunits.")
-                  # Handle global centering case if desired
-                  com_global_ref = calculate_com(coords_ref) # (n_batches, 3)
-                  target_coms_all = com_global_ref.unsqueeze(1) # Set target as input global COM (n_batches, 1, 3)
-                  if b_idx_diag < n_batches:
-                       initial_coms['Global'] = com_global_ref[b_idx_diag].cpu().numpy()
-                       print(f"Batch {b_idx_diag} - Using Input Global COM as target: {initial_coms['Global']}")
-                  subunits = [torch.arange(n_atoms, device=device)] # Treat as one global subunit
-                  n_subunits_found = 1 # Override previous value
-             else:
-                  # Stack the calculated reference COMs into the target tensor for the constraint function
-                  target_coms_all = torch.stack(target_coms_list, dim=1) # Shape: (n_batches, N_subunits, 3)
-                  print(f"DEBUG: Stacked target COMs from input reference. Shape: {target_coms_all.shape}")
-
-        else: # No subunits found by symmetry helper
-             print(f"Batch {b_idx_diag} - No subunits found by get_subunit_atom_indices.")
-             com_global_ref = calculate_com(coords_ref) # (n_batches, 3)
-             # Treat as a single entity, target COM is its input COM
-             target_coms_all = com_global_ref.unsqueeze(1) # Shape (n_batches, 1, 3)
-             if b_idx_diag < n_batches:
-                  initial_coms['Global'] = com_global_ref[b_idx_diag].cpu().numpy()
-                  print(f"Batch {b_idx_diag} - Input/Target Global COM: {initial_coms['Global']}")
-             # Define subunits as the whole structure for the constraint function
-             subunits = [torch.arange(n_atoms, device=device)]
-             n_subunits_found = 1 # Override previous value
-
-        print("="*60)
-        # ------- END DIAGNOSTIC/TARGET COM Calculation -------
+                if not target_coms_list or all(sub_inds.numel()==0 for sub_inds in subunits):
+                        print("Warning: All subunits are empty or no subunits found. Calculating global COM as target.")
+                        com_global_ref = calculate_com(coords_ref) # Use overall COM
+                        target_coms_all = com_global_ref.unsqueeze(1).expand(-1, n_subunits_found if n_subunits_found > 0 else 1, -1) # Expand to expected shape
+                        if n_subunits_found == 0: # Handle case where get_subunit_atom_indices returned empty list
+                            subunits = [torch.arange(n_atoms, device=device)] # Treat as one subunit
+                            n_subunits_found = 1
+                else:
+                        target_coms_all = torch.stack(target_coms_list, dim=1) # Shape: (n_batches, N_subunits, 3)
+        else: # No subunits found (e.g., monomer or incorrect setup)
+                print("DEBUG: No subunits found by get_subunit_atom_indices. Treating as monomer.")
+                com_global_ref = calculate_com(coords_ref)
+                target_coms_all = com_global_ref.unsqueeze(1)
+                subunits = [torch.arange(n_atoms, device=device)]
+                n_subunits_found = 1
+        print(f"DEBUG: Calculated TARGET COMs from INPUT reference. Shape: {target_coms_all.shape}")
 
 
-        # ======= Calculate Rotations for Symmetrical Noise/Denoising (New Logic) =======
-        # === MODIFICATION: Calculate I/C3 inter-trimer rotation using pseudo-quotient search ===
+        # ======= 4. Calculate Rotations for Symmetrical Noise/Denoising =======
         self.rot_mats_noI = None # Reset instance variable
 
         if self.symmetry_type == 'I' and n_subunits_found >= 6:
-            print("DEBUG: Calculating I/C3 rotations for noise/denoising symmetry (Pseudo-Quotient Search)")
+            print("DEBUG: Setting up IDEAL I/C3 rotations based on matching input A/D to template...")
 
-            if target_coms_all is None or target_coms_all.shape[1] < 6:
-                 print("Warning: Insufficient target COMs found for I symmetry rotation calculation. Symmetrical noise/denoising might be incorrect.")
-                 self.rot_mats_noI = None
-            else:
-                # Select COMs for rotation calculation (all shape: n_batches, 3)
-                com_A_ref = target_coms_all[:, 0, :] # Subunit A
-                com_B_ref = target_coms_all[:, 1, :] # Subunit B
-                com_C_ref = target_coms_all[:, 2, :] # Subunit C
-                com_D_ref = target_coms_all[:, 3, :] # Subunit D (Target for A->D rotation)
-                # com_E_ref = target_coms_all[:, 4, :] # Subunit E
-                # com_F_ref = target_coms_all[:, 5, :] # Subunit F
+            # --- 4a. Extract Input A and D Coordinates ---
+            # Assume subunit order is A, B', C', D, E, F... returned by get_subunit_atom_indices
+            if not subunits or subunits[0].numel() == 0:
+                raise ValueError("Cannot find reference chain A indices in input for Icosahedral symmetry setup.")
+            if n_subunits_found < 4 or subunits[3].numel() == 0:
+                 raise ValueError(f"Cannot find chain D (index 3) indices or not enough subunits ({n_subunits_found}) found for Icosahedral A->D mapping.")
 
-                # Ensure subunits list is correct length before indexing
-                if len(subunits) < 6:
-                    raise IndexError(f"Subunits list has length {len(subunits)}, expected at least 6 for I symmetry rotation calculation.")
+            # Use batch 0's A and D as representative for finding the ideal rotation map
+            ref_chain_A_indices = subunits[0]
+            ref_chain_D_indices = subunits[3] # Assuming D is the 4th subunit (index 3)
+            coords_chain_A_input = coords_ref[0, ref_chain_A_indices, :] # (N_atoms_A, 3)
+            coords_chain_D_input = coords_ref[0, ref_chain_D_indices, :] # (N_atoms_D, 3)
 
-                # --- Calculate Trimer COMs ---
-                trimer1_indices = torch.cat(subunits[:3]) # A, B, C
-                trimer2_indices = torch.cat(subunits[3:6]) # D, E, F
-                com_ABC_ref = calculate_com(coords_ref[:, trimer1_indices, :]) # (n_batches, 3)
-                com_DEF_ref = calculate_com(coords_ref[:, trimer2_indices, :]) # (n_batches, 3)
+            # --- 4b. Call the function to get the IDEAL A->D rotation ---
+            # This function also saves the temp CIF files internally
+            R_AD_ideal = self._generate_ideal_icosahedron_and_find_ad_map(
+                coords_chain_A = coords_chain_A_input,
+                coords_chain_D = coords_chain_D_input,
+                device = device,
+                dtype = dtype, # Request final rotation matrix in model's dtype
+                output_dir = output_dir
+            ) # Returns the IDEAL (3, 3) A->D rotation matrix
 
-                # --- Calculate Rotations WITHIN Trimer ABC (Direct) ---
-                vec_A_rel = com_A_ref - com_ABC_ref # (n_batches, 3)
-                vec_B_rel = com_B_ref - com_ABC_ref # (n_batches, 3)
-                vec_C_rel = com_C_ref - com_ABC_ref # (n_batches, 3)
+            # --- 4c. Calculate other required rotations using the IDEAL A->D map ---
+            # We need the rotations from reference A to B', C', D, E, F...
+            # A->B' is +120 deg Z rot, A->C' is +240 deg Z rot
+            rot_120_np = _build_rot_matrix_np(2 * math.pi / 3, 'z')
+            rot_240_np = _build_rot_matrix_np(4 * math.pi / 3, 'z')
+            R_B = torch.from_numpy(rot_120_np).to(device, dtype) # Ideal A->B'
+            R_C = torch.from_numpy(rot_240_np).to(device, dtype) # Ideal A->C'
+            R_D = R_AD_ideal # This IS the IDEAL A->D rotation we just found
+            R_E = torch.matmul(R_AD_ideal, R_B) # Ideal A -> E = (A->D)_ideal @ (A->B')_ideal
+            R_F = torch.matmul(R_AD_ideal, R_C) # Ideal A -> F = (A->D)_ideal @ (A->C')_ideal
 
-                # Note: compute_rotation_matrix_from_vectors handles batches
-                R_B_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_B_rel, device=device, dtype=coords_ref.dtype)
-                R_C_batch = compute_rotation_matrix_from_vectors(vec_A_rel, vec_C_rel, device=device, dtype=coords_ref.dtype)
-                # Result shapes: (n_batches, 3, 3)
+            # --- 4d. Assemble the rotation matrices for noise/denoising ---
+            # Order matters: corresponds to subunits[1] to subunits[N-1] relative to subunits[0].
+            # Assuming subunit order is A, B', C', D, E, F...
+            effective_rots = [ R_B, R_C, R_D, R_E, R_F ] # Rotations for B',C',D,E,F relative to A
 
-                # --- Calculate Inter-Trimer Rotation (A->D) using I/C3 Pseudo-Quotient Search ---
-                # Regenerate I/C3 rotations from scratch
-                print("DEBUG: Regenerating I/C3 pseudo-quotient matrices within sample()...")
-                IsubC3_rots = symmetry.get_pseudoquotient('I', 'C_3') # Shape (N_rots, 3, 3), N_rots=20
-                IsubC3_rots = IsubC3_rots.to(device, coords_ref.dtype)
-                print(f"DEBUG: Regenerated I/C3 matrices. Shape: {IsubC3_rots.shape}, Device: {IsubC3_rots.device}, Dtype: {IsubC3_rots.dtype}")
+            # Extend this list if more than 6 subunits are defined by get_subunit_atom_indices
+            expected_rots = n_subunits_found - 1
+            if len(effective_rots) < expected_rots:
+                 print(f"[Warning] Only defined rotations for first {len(effective_rots)+1} subunits (A-F...), but found {n_subunits_found}. Noise/denoising symmetrization might be incomplete for later subunits.")
+                 # Add identity matrices for the remaining expected subunits
+                 num_missing_rots = expected_rots - len(effective_rots)
+                 print(f"[Warning] Appending {num_missing_rots} identity matrices.")
+                 identity_mat = torch.eye(3, device=device, dtype=dtype)
+                 effective_rots.extend([identity_mat] * num_missing_rots)
+            elif len(effective_rots) > expected_rots:
+                 print(f"[Warning] Defined more rotations ({len(effective_rots)}) than needed ({expected_rots}). Truncating.")
+                 effective_rots = effective_rots[:expected_rots]
 
-                # Calculate the target vector for A: D relative to trimer DEF
-                vec_D_target_rel = com_D_ref - com_DEF_ref # (n_batches, 3)
-
-                # Find the best I/C3 rotation that maps vec_A_rel closest to vec_D_target_rel
-                print(f"DEBUG: Finding best I/C3 rotation: Target shape={vec_D_target_rel.shape}, Candidates={IsubC3_rots.shape}, Ref point shape={vec_A_rel.shape}")
-                R_I_sub_C3_batch = find_best_rotation_point_cloud(
-                    target_point=vec_D_target_rel,       # (B, 3)
-                    candidate_rots=IsubC3_rots,          # (N_rots, 3, 3)
-                    ref_point=vec_A_rel                  # (B, 3)
-                ) # Returns (n_batches, 3, 3)
-                print(f"DEBUG: Found best inter-trimer rotation R_I_sub_C3 (A->D) via search. Shape: {R_I_sub_C3_batch.shape}")
-
-                # Select the rotation for the first batch item -> (3, 3) for stacking
-                if n_batches != 1:
-                     print(f"WARNING: Batch size is {n_batches}, but extracting only the first rotation for self.rot_mats_noI used in noise/denoising.")
-                R_B = R_B_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
-                R_C = R_C_batch[0] # Extract (3, 3) from (n_batches, 3, 3)
-                R_I_sub_C3 = R_I_sub_C3_batch[0] # Use the rotation found via search
-
-                # --- Combine rotations for A->E, A->F (using compositions) ---
-                # R_E = R_I_sub_C3 @ R_B # Original logic
-                # R_F = R_I_sub_C3 @ R_C # Original logic
-                # Need to recalculate R_E, R_F properly? Assume A->E is R_I_sub_C3 @ R_B, A->F is R_I_sub_C3 @ R_C
-                # This assumes the I/C3 maps A->D, B->E, C->F.
-                R_E = torch.matmul(R_I_sub_C3, R_B)
-                R_F = torch.matmul(R_I_sub_C3, R_C)
-
-
-                effective_rots = [ R_B, R_C, R_I_sub_C3, R_E, R_F ]
-                self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, coords_ref.dtype) # Shape [5, 3, 3]
-                print(f"DEBUG: Calculated effective rotations for noise/denoising using I/C3 search. Shape: {self.rot_mats_noI.shape}")
+            # Store the final set of transformations WITHOUT the identity (implicit A->A)
+            self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, dtype)
+            print(f"DEBUG: Using IDEALIZED rotations derived from A/D matching for noise/denoising. Final Shape for {n_subunits_found} subunits: {self.rot_mats_noI.shape}")
 
         elif self.symmetry_type and n_subunits_found > 1:
-             print(f"DEBUG: Using precomputed {self.symmetry_type} rotations from __init__ for noise/denoising.")
-             if self.rot_mats_noI is None: # Use precomputed from __init__ if available
-                  print(f"Warning: Symmetry {self.symmetry_type} requested, but self.rot_mats_noI is None (from __init__). Symmetrical noise/denoising might not work correctly.")
-             else:
-                  self.rot_mats_noI = self.rot_mats_noI.to(device, coords_ref.dtype) # Ensure device/dtype
-                  print(f"DEBUG: Using precomputed rot_mats_noI. Shape: {self.rot_mats_noI.shape}")
+                # Use precomputed from __init__ if available (for non-Icosahedral cases)
+                if hasattr(self, 'rot_mats_noI') and self.rot_mats_noI is not None:
+                    # Ensure the number of matrices matches the number of non-identity subunits
+                    expected_rots = n_subunits_found - 1
+                    num_precomputed = self.rot_mats_noI.shape[0]
+
+                    if num_precomputed < expected_rots:
+                            print(f"[Warning] Precomputed rot_mats_noI has {num_precomputed} matrices, but expected {expected_rots} for {n_subunits_found} subunits. Appending identities.")
+                            self.rot_mats_noI = self.rot_mats_noI.to(device, dtype) # Ensure device/dtype first
+                            identity_mat = torch.eye(3, device=device, dtype=dtype)
+                            missing_rots = [identity_mat] * (expected_rots - num_precomputed)
+                            self.rot_mats_noI = torch.cat([self.rot_mats_noI] + missing_rots, dim=0)
+
+                    elif num_precomputed > expected_rots:
+                            print(f"[Warning] Precomputed rot_mats_noI has {num_precomputed} matrices, but expected {expected_rots}. Truncating.")
+                            self.rot_mats_noI = self.rot_mats_noI[:expected_rots].to(device, dtype)
+                    else:
+                            self.rot_mats_noI = self.rot_mats_noI.to(device, dtype) # Ensure device/dtype
+
+                    print(f"DEBUG: Using precomputed {self.symmetry_type} rot_mats_noI. Final Shape: {self.rot_mats_noI.shape}")
+                else:
+                    print(f"Warning: Symmetry {self.symmetry_type} requested, but no precomputed rot_mats_noI found or generated. Symmetrical noise/denoising will be basic Gaussian noise.")
+                    self.rot_mats_noI = None # Ensure it's None if no rotations available
         else: # Monomer or no symmetry specified
             print("DEBUG: No symmetry or monomer case. No rotations needed for noise/denoising.")
-            self.rot_mats_noI = None # Explicitly set to None
+            self.rot_mats_noI = None
 
         # Ensure self.rot_mats_noI is tensor or None before proceeding
-        if self.rot_mats_noI is not None and not isinstance(self.rot_mats_noI, torch.Tensor):
-            raise TypeError(f"self.rot_mats_noI should be a Tensor or None, but got {type(self.rot_mats_noI)}")
+        if self.rot_mats_noI is not None:
+                if not isinstance(self.rot_mats_noI, torch.Tensor):
+                    raise TypeError(f"self.rot_mats_noI should be a Tensor or None, but got {type(self.rot_mats_noI)}")
+                # Final check on number of rotations vs subunits
+                if self.rot_mats_noI.shape[0] != (n_subunits_found - 1):
+                     raise ValueError(f"Mismatch between final number of rotation matrices ({self.rot_mats_noI.shape[0]}) and expected ({n_subunits_found - 1})")
 
-        # ======= END Rotation Calculation (New Logic) =======
 
+        # ======= START: Reverse Diffusion Loop =======
 
-        # ======= START: Reverted Sampling Logic from OLD code =======
-
-        # 2. Build Diffusion Schedule (Old logic used self.sample_schedule)
+        # 5. Build Diffusion Schedule
         sigmas = self.sample_schedule(num_sampling_steps)
 
-        # 3. Determine Start Point (Forward Diffusion part - Old Logic)
+        # 6. Determine Start Point in Schedule
         start_index = max(0, num_sampling_steps - forward_diffusion_steps)
         start_sigma = sigmas[start_index]
-        # Calculate t_hat_initial based on old logic's use of noise_scale
-        t_hat_initial = start_sigma * self.noise_scale
-        # Sigma at the end of the first effective step
-        sigma_tm_val_initial = sigmas[start_index + 1].item() if start_index + 1 < len(sigmas) else 0.0
 
-        # Initialize current coordinates with the reference coordinates
+        # 7. Initialize Coordinates and Apply Initial Noise
+        # Start with the clean reference coordinates
         current_coords = coords_ref.clone()
 
-        # 4. Apply Initial Symmetrical Noise (Old Logic Style, New Noise Function)
-        # Uses self.rot_mats_noI (calculated above) and old schedule's t_hat_initial/sigma_tm_val_initial
+        # Calculate initial noise level
+        t_hat_initial = start_sigma * self.noise_scale
+        sigma_tm_val_initial = sigmas[start_index + 1].item() if start_index + 1 < len(sigmas) else 0.0
+
+        # Apply Initial Symmetrical Noise using the derived self.rot_mats_noI
         initial_sym_noise = self._symmetrical_noise(
-            current_coords, # Start from clean coords
-            feats,
-            subunits,
-            self.rot_mats_noI, # Use the dynamically computed rotations
-            t_hat_initial,    # Use t_hat from old logic
-            sigma_tm_val_initial # Use sigma at end of step from old logic
+            coords=current_coords,
+            feats=feats, # Pass feats for get_symmetrical_atom_mapping inside _symmetrical_noise
+            subunits=subunits,
+            rot_mats=self.rot_mats_noI, # Use the derived/loaded rotations
+            t_hat=t_hat_initial.item(),
+            sigma_tm_val=sigma_tm_val_initial # sigma at end of this (conceptual) step
         )
-        current_coords = current_coords + initial_sym_noise # Add noise
+        current_coords = current_coords + initial_sym_noise
         print(f"DEBUG: Applied initial symmetrical noise. Start t_hat={t_hat_initial:.4f}, sigma_end={sigma_tm_val_initial:.4f}")
 
-
-        # 5. Apply Initial Rigid Constraints (Using New Translation Constraint)
+        # 8. Apply Initial Rigid Constraints (Translate subunits to match INPUT reference COMs)
         if target_coms_all is None:
             raise RuntimeError("Target COMs tensor is None before applying initial constraints.")
-
         current_coords = self.apply_symmetry_constraints_rigid(
-             coords=current_coords, # Apply to noisy coords
-             subunits=subunits,
-             desired_coms_all_subunits=target_coms_all # Use target COMs from reference
+            coords=current_coords,
+            subunits=subunits,
+            desired_coms_all_subunits=target_coms_all # Target COMs from INPUT ref
         )
-        print(f"DEBUG: Applied initial rigid constraints using target COMs.")
+        print(f"DEBUG: Applied initial rigid constraints using target COMs from INPUT.")
 
-        # 6. Build Reverse Schedule (Old Logic with Gamma)
+        # 9. Build Reverse Schedule Steps
         reverse_schedule = []
         for i in range(start_index, len(sigmas) - 1):
             sigma_current = sigmas[i]
             sigma_next = sigmas[i + 1]
-            # Calculate gamma based on old logic
+            # Determine gamma (using instance attributes like self.gamma_0, self.gamma_min)
             gamma_val = self.gamma_0 if sigma_current > self.gamma_min else 0.0
-            reverse_schedule.append((sigma_current, sigma_next, gamma_val)) # Tuple: (sigma_tm, sigma_t, gamma_val)
+            reverse_schedule.append((sigma_current, sigma_next, gamma_val))
 
-        # 7. Prepare for Denoising Loop
+        # 10. Prepare for Denoising Loop
         token_repr = None
-        model_cache = {} # Keep model cache mechanism
+        model_cache = {} # Initialize cache if used
 
-        # --- 8. Reverse Diffusion Loop (Old Logic Structure) ---
-        print(f"DEBUG: Starting reverse diffusion loop (Old Style) for {len(reverse_schedule)} steps.")
+        # --- 11. Reverse Diffusion Loop ---
+        print(f"DEBUG: Starting reverse diffusion loop for {len(reverse_schedule)} steps.")
         for step_i, (sigma_tm, sigma_t, gamma_val) in enumerate(reverse_schedule):
             sigma_tm_val = sigma_tm.item()
-            sigma_t_val = sigma_t.item() # Sigma at the *end* of this step
-            gamma_val_val = float(gamma_val)
+            sigma_t_val = sigma_t.item()
+            gamma_val_val = float(gamma_val) # Ensure gamma is float
+            t_hat = sigma_tm_val * (1 + gamma_val_val) # Noise level for this step
 
-            # Calculate t_hat for this step (Old Logic)
-            t_hat = sigma_tm_val * (1 + gamma_val_val)
-
-            # Add Symmetrical Noise *for this step* (Old Logic Style, New Noise Function)
+            # Add Symmetrical Noise *for this step* using self.rot_mats_noI
             step_sym_noise = self._symmetrical_noise(
-                 current_coords, # Add noise to current state
-                 feats,
-                 subunits,
-                 self.rot_mats_noI, # Use dynamically computed rotations
-                 t_hat,            # Use t_hat for this step
-                 sigma_t_val       # Use sigma at the end of the step for variance calculation
+                    coords=current_coords,
+                    feats=feats, # Pass feats again
+                    subunits=subunits,
+                    rot_mats=self.rot_mats_noI,
+                    t_hat=t_hat,            # Current noise level
+                    sigma_tm_val=sigma_t_val # Sigma at end of step
             )
-            coords_noisy_step = current_coords + step_sym_noise # Noisy coords for *this step*
+            coords_noisy_step = current_coords + step_sym_noise
 
-            # Denoise using the preconditioned network (New Denoising Function)
-            # Input is the per-step noisy coords, sigma is t_hat (Old Logic Time)
+            # Denoise using preconditioned_network_forward_symmetry
+            # This function internally uses self.rot_mats_noI if applicable for denoising step
             denoised_coords, token_a = self.preconditioned_network_forward_symmetry(
                 coords_noisy=coords_noisy_step,
-                sigma=t_hat, # Use t_hat as the time input
+                sigma=t_hat, # Pass the noise level t_hat as sigma input to network
                 network_condition_kwargs=dict(
-                    multiplicity=multiplicity, # Pass multiplicity here
-                    model_cache=model_cache if self.use_inference_model_cache else None,
-                     **network_condition_kwargs
+                    # Ensure all necessary kwargs are passed
+                    s_inputs=network_condition_kwargs['s_inputs'],
+                    s_trunk=network_condition_kwargs['s_trunk'],
+                    z_trunk=network_condition_kwargs['z_trunk'],
+                    relative_position_encoding=network_condition_kwargs['relative_position_encoding'],
+                    feats=feats, # Pass updated feats dict
+                    multiplicity=multiplicity,
+                    model_cache=model_cache if self.use_inference_model_cache else None
                 ),
-                training=False,
+                training=False, # Ensure model is in eval mode conceptually
             )
 
-            # Apply Rigid Constraint after denoising (New Translation Constraint)
+            # Apply Rigid Constraint after denoising (Translate subunits to match INPUT reference COMs)
             denoised_coords = self.apply_symmetry_constraints_rigid(
-                coords=denoised_coords, # Apply to the denoised prediction
+                coords=denoised_coords,
                 subunits=subunits,
-                desired_coms_all_subunits=target_coms_all # Use target COMs
+                desired_coms_all_subunits=target_coms_all # Use INPUT reference COMs
             )
 
             # Update current coordinates for the next step
             current_coords = denoised_coords
-            # --- End Sampler Step (Old Style) ---
 
-
-            # Token accumulation logic (remains compatible, uses t_hat)
+            # Token accumulation logic (optional)
             if self.accumulate_token_repr:
-                if token_repr is None:
-                    token_repr = torch.zeros_like(token_a)
+                if token_repr is None: token_repr = torch.zeros_like(token_a)
+                # Ensure gradients are handled correctly if training accumulator
                 with torch.set_grad_enabled(train_accumulate_token_repr):
-                    # Use t_hat for time conditioning, matching the denoising step
-                    t_tensor = torch.full((current_coords.shape[0],), t_hat, device=device, dtype=coords_ref.dtype)
+                    t_tensor = torch.full((current_coords.shape[0],), t_hat, device=device, dtype=dtype)
                     token_repr = self.out_token_feat_update(
-                        times=self.c_noise(t_tensor), # Use c_noise consistent with training
-                        acc_a=token_repr,
-                        next_a=token_a, # Use token_a from the denoising step
+                        times=self.c_noise(t_tensor), acc_a=token_repr, next_a=token_a
                     )
             elif step_i == len(reverse_schedule) - 1: # Get final token repr if not accumulating
-                 token_repr = token_a
+                    token_repr = token_a
 
 
-        # 9. Final Output (Keep Final Constraint)
+        # 12. Final Output
         print(f"DEBUG: Reverse diffusion finished.")
-        # Final constraint application just to be safe
+        # Apply final constraint application using target_coms_all from INPUT
         final_coords = self.apply_symmetry_constraints_rigid(
-             coords=current_coords,
-             subunits=subunits,
-             desired_coms_all_subunits=target_coms_all
+                coords=current_coords,
+                subunits=subunits,
+                desired_coms_all_subunits=target_coms_all # Final enforcement
         )
 
+        # Return the final coordinates and accumulated/final token representation
         return {"sample_atom_coords": final_coords, "diff_token_repr": token_repr}
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1205,6 +1157,249 @@ class AtomDiffusion(nn.Module):
                         # else: # Optional: Handle cases where #subunits > #rot_mats (shouldn't happen with correct logic)
                         #     print(f"Warning: Skipping rotation for subunit {i_sub}, not enough rotation matrices.")
         return eps
+
+
+    # Inside the AtomDiffusion class in diffusion.py
+
+    def _generate_ideal_icosahedron_and_find_ad_map(
+        self,
+        coords_chain_A: torch.Tensor, # Coords for INPUT Chain A (N_atoms_A, 3)
+        coords_chain_D: torch.Tensor, # Coords for INPUT Chain D (N_atoms_D, 3)
+        device: torch.device,
+        dtype: torch.dtype,           # The final desired output dtype (e.g., float32)
+        output_dir: str = "."         # Directory to save the temp CIF files
+    ) -> torch.Tensor:
+        """
+        Generates a temporary "ideal" icosahedron template using input subunit A
+        as the generator. It identifies which subunits in this ideal template
+        best correspond (by COM distance) to the input subunits A and D.
+        It then calculates the *ideal rotation matrix* that transforms the
+        A-matching ideal subunit to the D-matching ideal subunit within the template.
+
+        Includes robust index checking and NumPy fallback for argmin. Corrected distance calc.
+
+        Saves:
+        1. The full ideal icosahedron template coordinates.
+        2. The coordinates of the two ideal subunits that best match input A and D.
+
+        Args:
+            coords_chain_A: Coordinates of the input reference chain A (N_atoms_A, 3).
+            coords_chain_D: Coordinates of the input target chain D (N_atoms_D, 3).
+            device: Target torch device.
+            dtype: Target torch dtype for the *final* output R_AD matrix.
+                   Internal calculations may use float64 for precision.
+            output_dir: Directory to save the temporary CIF files.
+
+        Returns:
+            torch.Tensor: The IDEAL rotation matrix (3, 3) that maps the position
+                          corresponding to input A to the position corresponding
+                          to input D within the generated ideal template.
+                          The matrix will have the specified output `dtype`.
+        """
+        #print("[Debug] Generating IDEAL icosahedron template to find A->D map...")
+        internal_dtype = torch.float64 # Use float64 for internal coordinate/op manipulations
+
+        # --- 0. Input Validation and Preparation ---
+        if coords_chain_A.shape[0] == 0: raise ValueError("Input coordinates for Chain A are empty.")
+        if coords_chain_D.shape[0] == 0: raise ValueError("Input coordinates for Chain D are empty.")
+        n_atoms_gen = coords_chain_A.shape[0]
+
+        coords_A_gen = coords_chain_A.to(device=device, dtype=internal_dtype)
+        coords_D_input = coords_chain_D.to(device=device, dtype=internal_dtype)
+
+        # Calculate COMs. Assuming calculate_com returns (B, 3) or (3,).
+        # We need it effectively as (1, 3) for broadcasting against (60, 3).
+        com_input_A = calculate_com(coords_A_gen)
+        if com_input_A.ndim == 1: com_input_A = com_input_A.unsqueeze(0) # Ensure (1, 3)
+        if torch.isnan(com_input_A).any() or torch.isinf(com_input_A).any(): raise ValueError(f"Input A COM calculation resulted in NaN/Inf: {com_input_A}")
+
+        com_input_D = calculate_com(coords_D_input)
+        if com_input_D.ndim == 1: com_input_D = com_input_D.unsqueeze(0) # Ensure (1, 3)
+        if torch.isnan(com_input_D).any() or torch.isinf(com_input_D).any(): raise ValueError(f"Input D COM calculation resulted in NaN/Inf: {com_input_D}")
+
+        # Make sure shape is exactly (1, 3) after checks
+        if com_input_A.shape != (1, 3): raise ValueError(f"com_input_A unexpected shape: {com_input_A.shape}")
+        if com_input_D.shape != (1, 3): raise ValueError(f"com_input_D unexpected shape: {com_input_D.shape}")
+
+        #print(f"[Debug] Input A COM: {com_input_A.cpu().numpy()}")
+        #print(f"[Debug] Input D COM: {com_input_D.cpu().numpy()}")
+
+        # --- 1. Generate C3 Rotations for initial ASU (using float64) ---
+        C3_GENERATION_ANGLE_1 = 2 * math.pi / 3
+        C3_GENERATION_ANGLE_2 = 4 * math.pi / 3
+        def _build_rot_matrix_pt_f64(angle: float, axis: str = 'z') -> torch.Tensor:
+            cos_a = math.cos(angle); sin_a = math.sin(angle)
+            if axis.lower() == 'z': mat_np = np.array([[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+            else: raise ValueError("Only Z axis needed for initial trimer")
+            return torch.from_numpy(mat_np).to(device=device, dtype=internal_dtype)
+        rot_120, rot_240 = _build_rot_matrix_pt_f64(C3_GENERATION_ANGLE_1, 'z'), _build_rot_matrix_pt_f64(C3_GENERATION_ANGLE_2, 'z')
+        identity_mat = torch.eye(3, device=device, dtype=internal_dtype)
+        component_rots = [identity_mat, rot_120, rot_240]
+
+        # --- 2. Create Ideal Trimer ASU {A, B', C'} ---
+        coords_B_prime_ideal = torch.matmul(coords_A_gen, rot_120.T)
+        coords_C_prime_ideal = torch.matmul(coords_A_gen, rot_240.T)
+        trimer_asu_coords_ideal = torch.cat([coords_A_gen, coords_B_prime_ideal, coords_C_prime_ideal], dim=0)
+
+        # --- 3. Get Canonical I/C3 Pseudo-Quotient Operators (g'_i) ---
+        #print("[Debug] Getting canonical I/C3 operators (g'_i)...")
+        try:
+            candidate_I_ops = symmetry.get_pseudoquotient_operators_transformed_numpy_style(device=device, dtype=internal_dtype)
+            if candidate_I_ops is None or candidate_I_ops.shape != (20, 3, 3): raise RuntimeError(f"Failed to get 20 I/C3 operators. Shape: {candidate_I_ops.shape if candidate_I_ops is not None else 'None'}")
+            print(f"[Debug] Obtained {candidate_I_ops.shape[0]} canonical I/C3 operators (g'_i) with dtype {candidate_I_ops.dtype}.")
+        except Exception as e: raise RuntimeError(f"Failed to get I/C3 operators: {e}") from e
+
+        # --- 4. Generate Full Ideal Icosahedron Coordinates & Store Subunits ---
+        all_coords_list_ideal, ideal_subunit_coords_list, ideal_subunit_labels, ideal_subunit_coms_list = [], [], [], []
+        #print("[Debug] Applying canonical operators to the ASU and storing subunits...")
+        for k, op_matrix in enumerate(candidate_I_ops):
+            rotated_trimer_ideal = torch.matmul(trimer_asu_coords_ideal, op_matrix.T)
+            all_coords_list_ideal.append(rotated_trimer_ideal)
+            subunits_in_k = [rotated_trimer_ideal[j * n_atoms_gen : (j + 1) * n_atoms_gen] for j in range(3)]
+            for j, sub_coords in enumerate(subunits_in_k):
+                ideal_subunit_coords_list.append(sub_coords)
+                ideal_subunit_labels.append((k, j))
+                com_sub = calculate_com(sub_coords)
+                # Ensure COM is (3,) before appending
+                if com_sub.ndim == 2: com_sub = com_sub.squeeze(0)
+                if com_sub.shape != (3,): raise ValueError(f"Ideal subunit COM shape error: Expected (3,), got {com_sub.shape}")
+                ideal_subunit_coms_list.append(com_sub)
+
+        full_coords_ideal = torch.cat(all_coords_list_ideal, dim=0)
+        ideal_subunit_coms = torch.stack(ideal_subunit_coms_list, dim=0) # Shape: (60, 3)
+        if ideal_subunit_coms.shape != (60, 3): raise ValueError(f"Expected ideal_subunit_coms shape (60, 3), got {ideal_subunit_coms.shape}")
+        if torch.isnan(ideal_subunit_coms).any() or torch.isinf(ideal_subunit_coms).any():
+            problematic_indices = torch.where(torch.isnan(ideal_subunit_coms).any(dim=1) | torch.isinf(ideal_subunit_coms).any(dim=1))[0]
+            raise ValueError(f"Ideal subunit COMs contain NaN or Inf at indices: {problematic_indices}.")
+        #print(f"[Debug] Full IDEAL icosahedron generated. Shape: {full_coords_ideal.shape}, Dtype: {full_coords_ideal.dtype}")
+        #print(f"[Debug] Calculated COMs for {ideal_subunit_coms.shape[0]} ideal subunits. Shape: {ideal_subunit_coms.shape}")
+
+        # --- 5. Find Ideal Subunits Matching Input A and D by COM Distance (Robust Check) ---
+        def find_min_idx_robust(distances, label=""):
+            """Finds min index robustly, checking torch.argmin output and using numpy fallback."""
+            dev = distances.device
+            dt = distances.dtype
+            expected_len = 60
+            # <<< Shape check moved here >>>
+            if not isinstance(distances, torch.Tensor) or distances.shape != (expected_len,):
+                raise ValueError(f"[{label}] Internal Error: Expected distances shape ({expected_len},), got {distances.shape if isinstance(distances, torch.Tensor) else type(distances)}")
+
+            valid_mask = ~torch.isnan(distances) & ~torch.isinf(distances)
+            num_valid = valid_mask.sum().item()
+            print(f"[{label}] Number of valid (non-NaN/Inf) distances: {num_valid} / {expected_len}")
+            if num_valid == 0:
+                print(f"[{label}] Error: No valid distances found.")
+                return None
+
+            temp_distances = torch.where(valid_mask, distances, torch.tensor(float('inf'), device=dev, dtype=dt))
+            min_idx_tensor = None
+            min_idx_val = -1
+
+            # --- Try PyTorch ---
+            try:
+                argmin_result = torch.argmin(temp_distances)
+                print(f"[{label}] torch.argmin direct result: {argmin_result}")
+                if not isinstance(argmin_result, torch.Tensor) or argmin_result.ndim != 0:
+                     print(f"[{label}] Error: torch.argmin did not return a scalar tensor. Type: {type(argmin_result)}, Shape: {argmin_result.shape if isinstance(argmin_result, torch.Tensor) else 'N/A'}")
+                else:
+                     min_idx_val = argmin_result.item()
+                     if 0 <= min_idx_val < expected_len:
+                          if torch.isinf(temp_distances[min_idx_val]): print(f"[{label}] Warning: torch.argmin yielded valid index {min_idx_val}, but value is Inf.")
+                          else:
+                               print(f"[{label}] torch.argmin SUCCEEDED with valid index: {min_idx_val}")
+                               min_idx_tensor = argmin_result
+                     else: print(f"[{label}] !!! Error: torch.argmin RETURNED INVALID INDEX: {min_idx_val} for expected range [0, {expected_len-1}] !!!")
+            except Exception as e: print(f"[{label}] Exception during torch.argmin or index check: {e}")
+
+            # --- Try NumPy Fallback ---
+            if min_idx_tensor is None:
+                print(f"[{label}] Attempting NumPy fallback...")
+                try:
+                    temp_distances_np = temp_distances.cpu().numpy()
+                    if temp_distances_np.shape != (expected_len,): print(f"[{label}] Error: NumPy array shape mismatch: {temp_distances_np.shape}"); return None
+                    if np.any(np.isnan(temp_distances_np)): print(f"[{label}] Warning: NaNs found in NumPy array after torch.where!?")
+                    min_idx_np = np.argmin(temp_distances_np)
+                    print(f"[{label}] numpy.argmin result: {min_idx_np}")
+                    if 0 <= min_idx_np < expected_len:
+                        if np.isinf(temp_distances_np[min_idx_np]): print(f"[{label}] Warning: numpy.argmin yielded valid index {min_idx_np}, but value is Inf.")
+                        else:
+                            print(f"[{label}] numpy.argmin SUCCEEDED with valid index: {min_idx_np}")
+                            min_idx_tensor = torch.tensor(min_idx_np, device=dev, dtype=torch.long)
+                    else: print(f"[{label}] !!! Error: numpy.argmin RETURNED INVALID INDEX: {min_idx_np} for expected range [0, {expected_len-1}] !!!")
+                except Exception as e_np: print(f"[{label}] Exception during numpy fallback: {e_np}")
+
+            if min_idx_tensor is None: print(f"[{label}] Error: Both PyTorch and NumPy argmin failed."); return None
+            else:
+                if min_idx_tensor.ndim == 0 and (0 <= min_idx_tensor.item() < expected_len): return min_idx_tensor
+                else: print(f"[{label}] Error: Final index tensor invalid: {min_idx_tensor}"); return None
+
+
+        # --- Calculate Distances CORRECTLY ---
+        # Subtract single input COM (1, 3) from all ideal COMs (60, 3) -> shape (60, 3)
+        # Calculate L2 norm along dim=1 -> shape (60,)
+        vector_diff_A = ideal_subunit_coms - com_input_A
+        dist_A_to_ideal = torch.linalg.norm(vector_diff_A, dim=1)
+        #print(f"[Debug] Calculated dist_A_to_ideal. Shape: {dist_A_to_ideal.shape}") # Add shape print
+
+        vector_diff_D = ideal_subunit_coms - com_input_D
+        dist_D_to_ideal = torch.linalg.norm(vector_diff_D, dim=1)
+        #print(f"[Debug] Calculated dist_D_to_ideal. Shape: {dist_D_to_ideal.shape}") # Add shape print
+
+
+        # Match Input A
+        idx_A_match_tensor = find_min_idx_robust(dist_A_to_ideal, label="MatchA")
+        if idx_A_match_tensor is None: raise ValueError("Failed to find valid index for Input A match.")
+        idx_A_match = idx_A_match_tensor.item()
+
+        # Match Input D
+        idx_D_match_tensor = find_min_idx_robust(dist_D_to_ideal, label="MatchD")
+        if idx_D_match_tensor is None: raise ValueError("Failed to find valid index for Input D match.")
+        idx_D_match = idx_D_match_tensor.item()
+
+        # --- Rest of the function remains the same ---
+
+        # Labels and Coords
+        min_dist_A = dist_A_to_ideal[idx_A_match]
+        label_A_match = ideal_subunit_labels[idx_A_match]
+        coords_A_ideal_match = ideal_subunit_coords_list[idx_A_match]
+        min_dist_D = dist_D_to_ideal[idx_D_match]
+        label_D_match = ideal_subunit_labels[idx_D_match]
+        coords_D_ideal_match = ideal_subunit_coords_list[idx_D_match]
+        #print(f"[Debug] Input A COM matches Ideal Subunit Index {idx_A_match} label {label_A_match} (Dist: {min_dist_A:.3f})")
+        #print(f"[Debug] Input D COM matches Ideal Subunit Index {idx_D_match} label {label_D_match} (Dist: {min_dist_D:.3f})")
+
+        # --- 6. Calculate the IDEAL Rotation ---
+        k_A, j_A = label_A_match
+        k_D, j_D = label_D_match
+        R_ref_A_match = candidate_I_ops[k_A] @ component_rots[j_A]
+        R_ref_D_match = candidate_I_ops[k_D] @ component_rots[j_D]
+        R_ideal_AD = R_ref_D_match @ R_ref_A_match.T
+        #print(f"[Debug] Calculated IDEAL rotation matrix R_ideal_AD.")
+
+        """
+        # --- 7. Save CIF Files ---
+        cif_filename_full = os.path.join(output_dir, "temp_ideal_icosahedron_full.cif")
+        try:
+            self._save_icosahedron_to_cif(coords=full_coords_ideal, filename=cif_filename_full)
+            print(f"[Debug] Saved FULL ideal template to {cif_filename_full}")
+        except Exception as e: print(f"[Warning] Failed to save full ideal CIF: {e}")
+        cif_filename_ad_match = os.path.join(output_dir, "temp_ideal_subunits_AD_matched.cif")
+        try:
+            coords_AD_matched_combined = torch.cat([coords_A_ideal_match, coords_D_ideal_match], dim=0)
+            self._save_icosahedron_to_cif(coords=coords_AD_matched_combined, filename=cif_filename_ad_match)
+            print(f"[Debug] Saved matched ideal subunits (A-like, D-like) to {cif_filename_ad_match}")
+        except Exception as e: print(f"[Warning] Failed to save matched A/D CIF: {e}")
+        """
+
+        # --- 8. Return the IDEAL rotation matrix ---
+        R_ideal_AD = R_ideal_AD.to(dtype)
+        #print(f"DEBUG: Found IDEAL A->D rotation matrix. Shape: {R_ideal_AD.shape}, Output Dtype: {R_ideal_AD.dtype}")
+        return R_ideal_AD
+
+
+
+
+
 
 
 
@@ -1350,43 +1545,172 @@ class AtomDiffusion(nn.Module):
         return mapping
 
 
-def plot_COM_distance_line(iterations: list[int], pre_denoising: list[float], post_denoising: list[float], filename: str, title: str = "Chain 0 COM Distance"):
-    plt.figure(figsize=(8,6))
-    plt.plot(iterations, pre_denoising, marker='o', color='blue', label='Before Denoising')
-    plt.plot(iterations, post_denoising, marker='o', color='red', label='After Denoising')
-    plt.xlabel("Iteration")
-    plt.ylabel("Distance from Origin")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(filename)
-    plt.close()
+    def _save_icosahedron_to_cif(
+        self,
+        coords: torch.Tensor, # Shape (B, N_total_atoms, 3) or (N_total_atoms, 3)
+        filename: str = "temp_icosahedron.cif",
+        batch_idx: int = 0
+    ) -> None:
+        """
+        Saves the Cartesian coordinates of a structure (like the generated icosahedron)
+        to a barebones CIF file. Uses Cartesian coordinates directly.
+
+        Args:
+            coords: Tensor containing the coordinates. Expected shape (B, N, 3) or (N, 3).
+            filename: Path to save the CIF file.
+            batch_idx: Index of the batch element to save if coords has a batch dim.
+        """
+        if coords.dim() == 3:
+            if batch_idx >= coords.shape[0]:
+                print(f"Warning: batch_idx {batch_idx} out of range for coords shape {coords.shape}. Saving batch 0.")
+                batch_idx = 0
+            coords_to_save = coords[batch_idx].detach().cpu().numpy() # Select batch and move to CPU
+        elif coords.dim() == 2:
+            coords_to_save = coords.detach().cpu().numpy() # Assume single structure
+        else:
+            raise ValueError(f"Unexpected coordinates shape: {coords.shape}. Expected (B, N, 3) or (N, 3).")
+
+        n_atoms = coords_to_save.shape[0]
+
+        # Create CIF content
+        cif_lines = []
+        cif_lines.append("data_icosahedron_vis")
+        cif_lines.append("#")
+        # Add dummy cell parameters - large enough to contain the structure
+        cif_lines.append("_cell_length_a     200.0")
+        cif_lines.append("_cell_length_b     200.0")
+        cif_lines.append("_cell_length_c     200.0")
+        cif_lines.append("_cell_angle_alpha  90.0")
+        cif_lines.append("_cell_angle_beta   90.0")
+        cif_lines.append("_cell_angle_gamma  90.0")
+        cif_lines.append("#")
+        cif_lines.append("loop_")
+        cif_lines.append("_atom_site_group_PDB") # Often 'ATOM' or 'HETATM'
+        cif_lines.append("_atom_site_type_symbol") # Element
+        cif_lines.append("_atom_site_label_atom_id") # Unique atom name
+        cif_lines.append("_atom_site_label_comp_id") # Residue/Molecule ID
+        cif_lines.append("_atom_site_label_asym_id") # Chain ID
+        cif_lines.append("_atom_site_label_seq_id") # Residue number (optional)
+        cif_lines.append("_atom_site_Cartn_x") # Cartesian X
+        cif_lines.append("_atom_site_Cartn_y") # Cartesian Y
+        cif_lines.append("_atom_site_Cartn_z") # Cartesian Z
+        cif_lines.append("_atom_site_occupancy")
+        cif_lines.append("_atom_site_B_iso_or_equiv")
+
+        # Determine atoms per original subunit (assuming A, B', C' had same size)
+        atoms_per_orig_subunit = coords_to_save.shape[0] // 60 # 20 triangles * 3 subunits per triangle
+        if coords_to_save.shape[0] % 60 != 0:
+             print(f"Warning: Total atoms ({coords_to_save.shape[0]}) not divisible by 60. Subunit assignment might be approximate.")
+             atoms_per_orig_subunit = max(1, coords_to_save.shape[0] // 60) # Avoid division by zero
+
+        chain_labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-def compute_rotation_matrix_from_vectors(vec1, vec2):
-    """
-    Compute the rotation matrix that rotates vec1 to vec2.
-    Both vec1 and vec2 should be 1D tensors of shape (3,).
-    """
-    # Normalize the input vectors.
-    a = vec1 / torch.norm(vec1)
-    b = vec2 / torch.norm(vec2)
-    # Compute the cross product and sine of the angle.
-    v = torch.cross(a, b)
-    s = torch.norm(v)
-    # Compute the cosine of the angle.
-    c = torch.dot(a, b)
-    # If the vectors are already aligned, return the identity.
-    if s < 1e-6:
-        return torch.eye(3, device=vec1.device, dtype=vec1.dtype)
-    # Skew-symmetric cross-product matrix of v.
-    vx = torch.tensor([[0, -v[2], v[1]],
-                       [v[2], 0, -v[0]],
-                       [-v[1], v[0], 0]], device=vec1.device, dtype=vec1.dtype)
-    # Rodrigues' rotation formula.
-    R = torch.eye(3, device=vec1.device, dtype=vec1.dtype) + vx + vx @ vx * ((1 - c) / (s**2))
-    return R
+        for i in range(n_atoms):
+            x, y, z = coords_to_save[i]
 
+            # Assign Chain ID based on which triangle it belongs to (0-19)
+            # Assign Residue ID based on which original subunit (A=1, B'=2, C'=3) within the triangle
+            triangle_index = i // (atoms_per_orig_subunit * 3)
+            subunit_in_triangle = (i % (atoms_per_orig_subunit * 3)) // atoms_per_orig_subunit
+            
+            # Assign Chain ID for the triangle
+            chain_id = chain_labels[triangle_index % len(chain_labels)] # Cycle through labels if > 62 triangles
+
+            # Assign Molecule ID (e.g., TRI for triangle) and residue number (subunit within triangle)
+            comp_id = "TRI"
+            seq_id = str(subunit_in_triangle + 1) # 1, 2, or 3
+
+            pdb_group = "ATOM"
+            atom_symbol = "C" # Use Carbon as placeholder
+            atom_label = f"C{i+1}" # Unique atom label
+
+
+            cif_lines.append(
+                f"{pdb_group:<6} {atom_symbol:<2} {atom_label:<4} {comp_id:<3} {chain_id:<1} {seq_id:<3} "
+                f"{x:8.3f} {y:8.3f} {z:8.3f} 1.00 20.00"
+            )
+
+        # Write to file
+        try:
+            with open(filename, 'w') as f:
+                f.write("\n".join(cif_lines) + "\n")
+            print(f"DEBUG: Saved generated icosahedron coordinates to {filename}")
+        except IOError as e:
+            print(f"Error saving CIF file {filename}: {e}")
+
+    def find_best_rotation_point_cloud(
+        self,
+        target_point: torch.Tensor,      # Target vector (B, 3) or (3,)
+        candidate_rots: torch.Tensor,    # Candidate rotation matrices (N_rots, 3, 3)
+        ref_point: torch.Tensor          # Reference vector to rotate (B, 3) or (3,)
+    ) -> torch.Tensor:
+        """
+        Finds the candidate rotation matrix that maps ref_point closest to target_point.
+
+        Args:
+            target_point: The target vector(s).
+            candidate_rots: Pool of rotation matrices to test.
+            ref_point: The starting reference vector(s).
+
+        Returns:
+            torch.Tensor: The best rotation matrix found (3, 3) or (B, 3, 3).
+                          Returns (3,3) if input points are (3,), (B,3,3) if input points are (B,3).
+        """
+        n_rots = candidate_rots.shape[0]
+        device = target_point.device
+        dtype = target_point.dtype
+        candidate_rots = candidate_rots.to(device, dtype) # Ensure correct device/dtype
+
+        is_batched = target_point.ndim == 2
+
+        if not is_batched:
+            # Add batch dimension for unified processing
+            target_point = target_point.unsqueeze(0) # (1, 3)
+            ref_point = ref_point.unsqueeze(0)       # (1, 3)
+
+        B = target_point.shape[0]
+
+        # Prepare tensors for broadcasting
+        # ref_point:      (B, 1, 3)
+        # candidate_rots: (1, N_rots, 3, 3)
+        # target_point:   (B, 1, 3)
+        ref_point_exp = ref_point.unsqueeze(1)             # (B, 1, 3)
+        cand_rots_exp = candidate_rots.unsqueeze(0)        # (1, N_rots, 3, 3)
+        target_point_exp = target_point.unsqueeze(1)       # (B, 1, 3)
+
+        # Apply all rotations to the reference point(s) via batch matrix multiplication
+        # Result shape: (B, N_rots, 3)
+        # rotated_points = torch.matmul(ref_point_exp.unsqueeze(2), cand_rots_exp.permute(0, 1, 3, 2)).squeeze(2) # Older PyTorch/incorrect matmul
+        # Correct approach: einsum or matmul with proper dimensions
+        # rotated_points[b, r, k] = sum_j ref_point_exp[b, 0, j] * cand_rots_exp[0, r, k, j] (R^T * p)
+        # OR rotated_points[b, r, k] = sum_j cand_rots_exp[0, r, k, j] * ref_point_exp[b, 0, j] (R * p) need R to be (3,3)
+
+        # Simpler: Expand ref_point and apply matmul N_rots times
+        # ref_point_exp: (B, 1, 1, 3)
+        # cand_rots_exp: (1, N_rots, 3, 3) -> transpose -> (1, N_rots, 3, 3)
+        # Target: R @ p^T -> (3,3) @ (3,1) -> (3,1) -> transpose -> (1,3)
+        # Target: p @ R^T -> (1,3) @ (3,3) -> (1,3)
+        # Let's use p @ R^T
+        ref_point_exp = ref_point.unsqueeze(1) # (B, 1, 3)
+        cand_rots_transposed = candidate_rots.permute(0, 2, 1).unsqueeze(0) # (1, N_rots, 3, 3)
+        rotated_points = torch.matmul(ref_point_exp, cand_rots_transposed) # (B, N_rots, 3)
+
+
+        # Calculate squared distances between rotated points and target point
+        # dist_sq shape: (B, N_rots)
+        dist_sq = torch.sum((rotated_points - target_point_exp)**2, dim=-1)
+
+        # Find the index of the minimum distance for each batch element
+        best_rot_indices = torch.argmin(dist_sq, dim=1) # Shape: (B,)
+
+        # Select the best rotation matrix for each batch element
+        best_rots = candidate_rots[best_rot_indices] # Shape: (B, 3, 3)
+
+        if not is_batched:
+            return best_rots.squeeze(0) # Return (3, 3)
+        else:
+            return best_rots # Return (B, 3, 3)
 
 
 # ================================
@@ -1455,104 +1779,94 @@ def calculate_com(coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tens
     return com
 
 
-def compute_rotation_matrix_from_vectors(vec1, vec2, device='cpu', dtype=torch.float32):
+def find_best_rotation_point_cloud(
+    target_point: torch.Tensor,      # Target vector (B, 3) or (3,)
+    candidate_rots: torch.Tensor,    # Candidate rotation matrices (N_rots, 3, 3)
+    ref_point: torch.Tensor          # Reference vector to rotate (B, 3) or (3,)
+) -> torch.Tensor:
     """
-    Compute the rotation matrix that rotates vec1 to vec2. Handles batches.
-    vec1, vec2: Tensors of shape (B, 3).
-    Returns: Tensor of shape (B, 3, 3).
-    """
-    B = vec1.shape[0]
-    a = F.normalize(vec1, p=2, dim=1)
-    b = F.normalize(vec2, p=2, dim=1)
-
-    v = torch.cross(a, b, dim=1)
-    s = torch.linalg.norm(v, dim=1) # Sine of the angle (B,)
-    c = torch.sum(a * b, dim=1)    # Cosine of the angle (B,)
-
-    # Handle cases where vectors are nearly parallel or anti-parallel
-    identity = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
-    # parallel case (a == b)
-    parallel_mask = s < 1e-6
-    # anti-parallel case (a == -b) -> rotate 180 deg around an arbitrary axis perp to a
-    antiparallel_mask = (s < 1e-6) & (c < -0.99999)
-
-    # Skew-symmetric cross-product matrix [v]x
-    vx = torch.zeros(B, 3, 3, device=device, dtype=dtype)
-    vx[:, 0, 1] = -v[:, 2]
-    vx[:, 0, 2] = v[:, 1]
-    vx[:, 1, 0] = v[:, 2]
-    vx[:, 1, 2] = -v[:, 0]
-    vx[:, 2, 0] = -v[:, 1]
-    vx[:, 2, 1] = v[:, 0]
-
-    # Rodrigues' rotation formula component: (1 - c) / s^2
-    # Avoid division by zero when s is small
-    s_squared = s**2
-    term_factor = torch.where(parallel_mask, torch.zeros_like(c), (1 - c) / torch.clamp(s_squared, min=1e-12))
-
-    R = identity + vx + torch.bmm(vx, vx) * term_factor.unsqueeze(-1).unsqueeze(-1)
-
-    # Handle anti-parallel case: find an axis perp to 'a' and rotate 180 deg
-    # Find a vector not parallel to 'a'
-    not_parallel = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(B,-1)
-    alt_vec = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(B,-1)
-    # Check if [1,0,0] is parallel to 'a'
-    dot_prod = torch.abs(torch.sum(a * not_parallel, dim=1))
-    axis_candidate = torch.where(dot_prod.unsqueeze(-1) > 0.999, alt_vec, not_parallel)
-    # Axis is cross product of 'a' and the non-parallel vector
-    rot_axis = F.normalize(torch.cross(a, axis_candidate, dim=1), p=2, dim=1)
-    # 180 degree rotation matrix: 2 * axis * axis^T - I
-    axis_outer = torch.einsum('bi,bj->bij', rot_axis, rot_axis)
-    R_180 = 2 * axis_outer - identity
-
-    # Apply corrections
-    R = torch.where(parallel_mask.unsqueeze(-1).unsqueeze(-1), identity, R)
-    R = torch.where(antiparallel_mask.unsqueeze(-1).unsqueeze(-1), R_180, R)
-
-
-    return R
-
-
-def find_best_rotation_point_cloud(target_point: torch.Tensor, # (B, 3)
-                                   candidate_rots: torch.Tensor, # (N_rots, 3, 3)
-                                   ref_point: torch.Tensor # (B, 3)
-                                   ) -> torch.Tensor:
-    """
-    Finds the best rotation matrix from candidates that maps ref_point closest to target_point.
+    Finds the candidate rotation matrix that maps ref_point closest to target_point.
 
     Args:
-        target_point: Target coordinates (B, 3).
-        candidate_rots: Candidate rotation matrices (N_rots, 3, 3).
-        ref_point: Reference coordinates to be rotated (B, 3).
+        target_point: The target vector(s).
+        candidate_rots: Pool of rotation matrices to test.
+        ref_point: The starting reference vector(s).
 
     Returns:
-        torch.Tensor: The best rotation matrix for each batch element (B, 3, 3).
+        torch.Tensor: The best rotation matrix found (3, 3) or (B, 3, 3).
+                      Returns (3,3) if input points are (3,), (B,3,3) if input points are (B,3).
     """
-    B = target_point.shape[0]
-    N_rots = candidate_rots.shape[0]
+    n_rots = candidate_rots.shape[0]
     device = target_point.device
     dtype = target_point.dtype
+    candidate_rots = candidate_rots.to(device, dtype) # Ensure correct device/dtype
 
-    # Expand dims for broadcasting:
-    # target: (B, 1, 3)
-    # ref:    (B, 1, 3)
-    # rots:   (1, N_rots, 3, 3)
-    target_exp = target_point.unsqueeze(1)
-    ref_exp = ref_point.unsqueeze(1)
-    rots_exp = candidate_rots.unsqueeze(0).to(device, dtype)
+    is_batched = target_point.ndim == 2
 
-    # Apply all rotations to the reference point: R @ ref.T -> (B, N_rots, 3, 3) @ (B, 1, 3, 1) -> needs einsum
-    # rotated_ref = torch.einsum('rji,bzi->brj', rots_exp.squeeze(0), ref_exp) # Incorrect shape handling
-    # R is (N, 3, 3), ref is (B, 3). Output should be (B, N, 3)
-    rotated_ref = torch.einsum('nij,bj->bni', candidate_rots.to(device, dtype), ref_point) # Shape: (B, N_rots, 3)
+    if not is_batched:
+        # Add batch dimension for unified processing
+        target_point = target_point.unsqueeze(0) # (1, 3)
+        ref_point = ref_point.unsqueeze(0)       # (1, 3)
 
-    # Calculate squared distances: || target - rotated_ref ||^2
-    distances_sq = torch.sum((target_exp - rotated_ref)**2, dim=2) # Shape: (B, N_rots)
+    B = target_point.shape[0]
+
+    # Prepare tensors for broadcasting
+    # ref_point:      (B, 1, 3)
+    # candidate_rots: (1, N_rots, 3, 3)
+    # target_point:   (B, 1, 3)
+    ref_point_exp = ref_point.unsqueeze(1)             # (B, 1, 3)
+    cand_rots_exp = candidate_rots.unsqueeze(0)        # (1, N_rots, 3, 3)
+    target_point_exp = target_point.unsqueeze(1)       # (B, 1, 3)
+
+    # Apply all rotations to the reference point(s) via batch matrix multiplication
+    # Result shape: (B, N_rots, 3)
+    # rotated_points = torch.matmul(ref_point_exp.unsqueeze(2), cand_rots_exp.permute(0, 1, 3, 2)).squeeze(2) # Older PyTorch/incorrect matmul
+    # Correct approach: einsum or matmul with proper dimensions
+    # rotated_points[b, r, k] = sum_j ref_point_exp[b, 0, j] * cand_rots_exp[0, r, k, j] (R^T * p)
+    # OR rotated_points[b, r, k] = sum_j cand_rots_exp[0, r, k, j] * ref_point_exp[b, 0, j] (R * p) need R to be (3,3)
+
+    # Simpler: Expand ref_point and apply matmul N_rots times
+    # ref_point_exp: (B, 1, 1, 3)
+    # cand_rots_exp: (1, N_rots, 3, 3) -> transpose -> (1, N_rots, 3, 3)
+    # Target: R @ p^T -> (3,3) @ (3,1) -> (3,1) -> transpose -> (1,3)
+    # Target: p @ R^T -> (1,3) @ (3,3) -> (1,3)
+    # Let's use p @ R^T
+    ref_point_exp = ref_point.unsqueeze(1) # (B, 1, 3)
+    cand_rots_transposed = candidate_rots.permute(0, 2, 1).unsqueeze(0) # (1, N_rots, 3, 3)
+    rotated_points = torch.matmul(ref_point_exp, cand_rots_transposed) # (B, N_rots, 3)
+
+
+    # Calculate squared distances between rotated points and target point
+    # dist_sq shape: (B, N_rots)
+    dist_sq = torch.sum((rotated_points - target_point_exp)**2, dim=-1)
 
     # Find the index of the minimum distance for each batch element
-    best_rot_indices = torch.argmin(distances_sq, dim=1) # Shape: (B,)
+    best_rot_indices = torch.argmin(dist_sq, dim=1) # Shape: (B,)
 
     # Select the best rotation matrix for each batch element
-    best_rots = candidate_rots[best_rot_indices].to(device, dtype) # Shape: (B, 3, 3)
+    best_rots = candidate_rots[best_rot_indices] # Shape: (B, 3, 3)
 
-    return best_rots
+    if not is_batched:
+        return best_rots.squeeze(0) # Return (3, 3)
+    else:
+        return best_rots # Return (B, 3, 3)
+
+
+def _build_rot_matrix_np(angle: float, axis: str = 'z') -> np.ndarray:
+    # (Copy definition from post_process or above)
+    cos_a = np.cos(angle)
+    sin_a = np.sin(angle)
+    if axis.lower() == 'z':
+        return np.array([[cos_a, -sin_a, 0.0],
+                         [sin_a, cos_a, 0.0],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
+    elif axis.lower() == 'y':
+        return np.array([[cos_a, 0.0, sin_a],
+                         [0.0, 1.0, 0.0],
+                         [-sin_a, 0.0, cos_a]], dtype=np.float64)
+    elif axis.lower() == 'x':
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, cos_a, -sin_a],
+                         [0.0, sin_a, cos_a]], dtype=np.float64)
+    else:
+        raise ValueError("Axis must be 'x', 'y', or 'z'")
