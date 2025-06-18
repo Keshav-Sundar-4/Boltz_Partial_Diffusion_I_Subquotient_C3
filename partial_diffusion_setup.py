@@ -5,6 +5,9 @@ import numpy as np
 import random
 from collections import defaultdict # Import defaultdict
 
+#run using:
+# python3 partial_diffusion_setup.py path/to/input_structure.pdb
+
 # Mapping from three-letter codes to one-letter codes for standard amino acids.
 THREE_TO_ONE = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D',
